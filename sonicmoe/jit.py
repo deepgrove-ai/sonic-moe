@@ -1,11 +1,12 @@
 # ********************************************************************************
 # Copyright (c) 2025, Wentao Guo, Mayank Mishra, Xinle Cheng, Ion Stoica, Tri Dao
 # ********************************************************************************
+from __future__ import annotations
 
 import inspect
 import os
+from collections.abc import Callable
 from shutil import rmtree
-from typing import Callable
 from uuid import uuid4
 
 import torch
@@ -31,13 +32,17 @@ def _get_cpp_function(function_name: str, module_name: str, source_files: list[s
         os.path.dirname(os.path.dirname(__file__)) + "/cutlass/tools/util/include",  # cutlass
     ]
 
-    module = _ALL_COMPILED_MODULES.get(module_name, None)
+    module = _ALL_COMPILED_MODULES.get(module_name)
 
     if module is None:
         if torch.distributed.is_initialized():
             os.makedirs(build_directory, exist_ok=True)
+            global _GLOBAL_RANK, _WORLD_SIZE
+            _GLOBAL_RANK = torch.distributed.get_rank()
+            _WORLD_SIZE = torch.distributed.get_world_size()
 
             if _GLOBAL_RANK == 0:
+                print(f"Loading {module_name} {source_files=} {build_directory=} on rank {_GLOBAL_RANK} with {_WORLD_SIZE} ranks")
                 module = load_cpp_extension(
                     module_name,
                     sources=source_files,
@@ -48,6 +53,7 @@ def _get_cpp_function(function_name: str, module_name: str, source_files: list[s
                     build_directory=build_directory,
                     verbose=True,
                 )
+                print(f"Loaded {module_name} {source_files=} {build_directory=} on rank {_GLOBAL_RANK} with {_WORLD_SIZE} ranks")
 
             torch.distributed.barrier()
 

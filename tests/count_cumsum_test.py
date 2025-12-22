@@ -1,19 +1,19 @@
 # ********************************************************************************
 # Copyright (c) 2025, Wentao Guo, Mayank Mishra, Xinle Cheng, Ion Stoica, Tri Dao
 # ********************************************************************************
+from __future__ import annotations
 
 import random
-from typing import Callable
+from collections.abc import Callable
 
 import torch
 from parameterized import parameterized
-
 from sonicmoe import count_cumsum
 
 from .test_commons import TestCommons
 
 
-def get_1d_tensor_sizes() -> list[tuple[int]]:
+def get_1d_tensor_sizes() -> set[tuple[int]]:
     sizes = set()
     # powers of 2
     for i in range(15):

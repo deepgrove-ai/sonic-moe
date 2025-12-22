@@ -1,11 +1,11 @@
 # ********************************************************************************
 # Copyright (c) 2025, Wentao Guo, Mayank Mishra, Xinle Cheng, Ion Stoica, Tri Dao
 # ********************************************************************************
+from __future__ import annotations
 
 import argparse
 import random
 import time
-from typing import Tuple, Type
 
 import cutlass
 import torch
@@ -27,7 +27,7 @@ def swiglu(x: torch.Tensor) -> torch.Tensor:
 def geglu(x: torch.Tensor) -> torch.Tensor:
     u = x[..., 1::2]
     g = x[..., ::2]
-    return (F.gelu(g.float()).to(dtype=g.dtype) * u)
+    return F.gelu(g.float()).to(dtype=g.dtype) * u
 
 
 def gelu(x: torch.Tensor) -> torch.Tensor:
@@ -41,7 +41,7 @@ def reglu(x: torch.Tensor) -> torch.Tensor:
 
 
 def relu(x: torch.Tensor) -> torch.Tensor:
-    return F.relu(x) 
+    return F.relu(x)
 
 
 def relu_sq(x: torch.Tensor) -> torch.Tensor:
@@ -78,11 +78,7 @@ def parse_arguments() -> argparse.Namespace:
         action="store_true",
         default=False,
     )
-    parser.add_argument(
-        "--activation",
-        choices=["swiglu", "geglu", "reglu", "relu_sq", "relu", "silu", "gelu"],
-        default="swiglu"
-    )
+    parser.add_argument("--activation", choices=["swiglu", "geglu", "reglu", "relu_sq", "relu", "silu", "gelu"], default="swiglu")
     parser.add_argument(
         "--add_bias",
         action="store_true",
@@ -104,11 +100,11 @@ def our_e2e_fwd_bwd_call(moe, x, dout):
 
 
 def run(
-    thiek: Tuple[int, int, int, int, int],
-    dtype: Type[cutlass.Numeric],
-    skip_test: Type[bool],
-    add_bias: Type[bool],
-    activation: Type[str],
+    thiek: tuple[int, int, int, int, int],
+    dtype: type[cutlass.Numeric],
+    skip_test: bool,
+    add_bias: bool,
+    activation: str,
     **kwargs,
 ):
     torch_dtype = {cutlass.BFloat16: torch.bfloat16, cutlass.Float16: torch.float16}[dtype]
@@ -151,20 +147,10 @@ def run(
     # # Ref check
     if not skip_test:
         o, router_logits, expert_frequency = moe_TC_softmax_topk_layer(
-            x,
-            router_w,
-            w1.permute(1, 2, 0),
-            b1,
-            w2.permute(1, 2, 0),
-            b2,
-            moe.top_k,
-            moe.stream_id,
-            activation
+            x, router_w, w1.permute(1, 2, 0), b1, w2.permute(1, 2, 0), b2, moe.top_k, moe.stream_id, activation
         )
         if add_bias:
-            dx, dw1, db1, dw2, db2, drouter_w = torch.autograd.grad(
-                o, [x, w1, b1, w2, b2, router_w], grad_outputs=dout
-            )
+            dx, dw1, db1, dw2, db2, drouter_w = torch.autograd.grad(o, [x, w1, b1, w2, b2, router_w], grad_outputs=dout)
         else:
             dx, dw1, dw2, drouter_w = torch.autograd.grad(o, [x, w1, w2, router_w], grad_outputs=dout)
 
@@ -182,11 +168,10 @@ def run(
             ActivationType.SWIGLU: swiglu,
             ActivationType.GEGLU: geglu,
             ActivationType.REGLU: reglu,
-            
             ActivationType.GELU: gelu,
             ActivationType.RELU: relu,
             ActivationType.SILU: silu,
-            ActivationType.RELU_SQ: relu_sq
+            ActivationType.RELU_SQ: relu_sq,
         }[activation]
 
         with torch.autocast("cuda:0", torch.float32):
@@ -198,7 +183,7 @@ def run(
 
                 if T_idx.numel() > 0:
                     w1_out = F.linear(x[T_idx, :], w1[i, :, :].squeeze(), bias=(b1[i] if add_bias else None))
-                    w1_out = act_func(w1_out) 
+                    w1_out = act_func(w1_out)
 
                     w2_out = F.linear(w1_out, w2[i, :, :].squeeze(), bias=(b2[i] if add_bias else None))
 
@@ -224,9 +209,7 @@ def run(
                     ("drouter_w", drouter_w, ref_drouter_w),
                 ]
             else:
-                ref_dx, ref_dw1, ref_dw2, ref_drouter_w = torch.autograd.grad(
-                    ref_o, [x, w1, w2, router_w], grad_outputs=dout
-                )
+                ref_dx, ref_dw1, ref_dw2, ref_drouter_w = torch.autograd.grad(ref_o, [x, w1, w2, router_w], grad_outputs=dout)
                 test_triple_list = [
                     ("dx", dx, ref_dx),
                     ("dw2", dw2, ref_dw2),
@@ -243,7 +226,7 @@ def run(
         flops = 6 * T * I * H * K
     else:
         flops = 4 * T * I * H * K
-    
+
     repeats = 500
     warmup = 5
 
@@ -273,9 +256,7 @@ def run(
 
     timing = do_bench(lambda: forward_only(True), warmup=warmup, rep=repeats)
     tflops = flops / (timing * 1e9)  # Convert to TFlops
-    print0(
-        f"[bold green][/bold green] Cute-DSL Fwd, inference mode, Average time: {timing:.3f} ms, TFLOPS: {tflops:.1f}"
-    )
+    print0(f"[bold green][/bold green] Cute-DSL Fwd, inference mode, Average time: {timing:.3f} ms, TFLOPS: {tflops:.1f}")
 
     if is_glu(activation):
         flops = 18 * T * I * H * K
@@ -287,7 +268,16 @@ def run(
     @torch.compile
     def forward_and_backward():
         o, router_logits, expert_frequency = moe_TC_softmax_topk_layer(
-            x, router_w, w1.permute(1, 2, 0), b1, w2.permute(1, 2, 0), b2, moe.top_k, moe.stream_id, activation, False, 
+            x,
+            router_w,
+            w1.permute(1, 2, 0),
+            b1,
+            w2.permute(1, 2, 0),
+            b2,
+            moe.top_k,
+            moe.stream_id,
+            activation,
+            False,
         )
         o.backward(dout, retain_graph=True)
         x.grad = w1.grad = w2.grad = router_w.grad = None
@@ -295,7 +285,6 @@ def run(
     e2e_timing = do_bench(forward_and_backward, warmup=warmup, rep=repeats, grad_to_none=[x, w1, w2, router_w, dout])
     tflops = flops / (e2e_timing * 1e9)  # Convert to TFlops
     print0(f"[bold green][/bold green] Cute-DSL Fwd + Bwd Average time: {e2e_timing:.3f} ms, TFLOPS: {tflops:.1f}")
-
 
     if is_glu(activation):
         flops = 12 * T * I * H * K

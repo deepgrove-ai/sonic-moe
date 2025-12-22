@@ -1,8 +1,10 @@
 # ********************************************************************************
 # Copyright (c) 2025, Wentao Guo, Mayank Mishra, Xinle Cheng, Ion Stoica, Tri Dao
 # ********************************************************************************
+from __future__ import annotations
 
-from typing import Any, Callable
+from collections.abc import Callable
+from typing import Any
 
 import torch
 from cutlass.cute.runtime import from_dlpack
@@ -60,9 +62,7 @@ def get_next_power_of_2(x: int) -> int:
     return x
 
 
-def convert_torch_tensor_to_cute_tensor(
-    x: torch.Tensor, stride_order, leading_dim: int, alignment: int, divisibility: int
-):
+def convert_torch_tensor_to_cute_tensor(x: torch.Tensor, stride_order, leading_dim: int, alignment: int, divisibility: int):
     return (
         from_dlpack(x, assumed_align=alignment)
         .mark_layout_dynamic(leading_dim=leading_dim)

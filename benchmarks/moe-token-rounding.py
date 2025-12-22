@@ -39,7 +39,6 @@ def ref_moe_token_rounding(
         T_idx = selected_T[pos]
 
         if T_idx.numel() > 0:
-
             w1_out = F.linear(x[T_idx, :], w1[i, :, :].squeeze(), bias=(b1[i] if b1 is not None else None))
             w1_out = F.silu(w1_out[:, ::2]) * w1_out[:, 1::2]
 
@@ -190,11 +189,10 @@ def run(
     dtype: Type[cutlass.Numeric],
     rep: int,
     routing: str,
-    skip_test: Type[bool],
-    add_bias: Type[bool],
+    skip_test: bool,
+    add_bias: bool,
     **kwargs,
 ):
-
     cutlass_dtype = dtype
     torch_dtype = {cutlass.BFloat16: torch.bfloat16, cutlass.Float16: torch.float16}[dtype]
 
@@ -253,9 +251,7 @@ def run(
             router_scores_selected, selected_T, selected_E = forward_topk(x, router_w, E, K)
             router_scores_selected_clone, _, _ = forward_topk(x_clone, router_w, E, K)
         else:
-            router_scores_selected, selected_T, selected_E = forward_token_choice_rounding(
-                x, router_w, E, K, Mtile, routing
-            )
+            router_scores_selected, selected_T, selected_E = forward_token_choice_rounding(x, router_w, E, K, Mtile, routing)
             router_scores_selected_clone, _, _ = forward_token_choice_rounding(x_clone, router_w, E, K, Mtile, routing)
 
         o, expert_frequency = moe_general_routing_inputs(
@@ -273,9 +269,7 @@ def run(
             False,
         )
         if add_bias:
-            dx, dw1, db1, dw2, db2, drouter_w = torch.autograd.grad(
-                o, [x, w1, b1, w2, b2, router_w], grad_outputs=dout
-            )
+            dx, dw1, db1, dw2, db2, drouter_w = torch.autograd.grad(o, [x, w1, b1, w2, b2, router_w], grad_outputs=dout)
         else:
             dx, dw1, dw2, drouter_w = torch.autograd.grad(o, [x, w1, w2, router_w], grad_outputs=dout)
 
@@ -429,7 +423,7 @@ def run(
     print0(f"[bold green][/bold green] {routing}, E2E Average time: {avg_time[1]:.3f} ms, TFLOPS: {avg_tflops[1]:.1f}")
     print0(f"[bold green][/bold green] {routing}, Bwd Average time: {avg_time[2]:.3f} ms, TFLOPS: {avg_tflops[2]:.1f}")
     print0(
-        f"[bold green][/bold green] {routing}, processed tokens, hardware tokens {total_processed_tokens:.1f}, {total_hardware_tokens:.1f}. wasted ratio {(total_hardware_tokens-total_processed_tokens)/total_processed_tokens:.3f}"
+        f"[bold green][/bold green] {routing}, processed tokens, hardware tokens {total_processed_tokens:.1f}, {total_hardware_tokens:.1f}. wasted ratio {(total_hardware_tokens - total_processed_tokens) / total_processed_tokens:.3f}"
     )
 
 

@@ -1,8 +1,7 @@
 # ********************************************************************************
 # Copyright (c) 2025, Wentao Guo, Mayank Mishra, Xinle Cheng, Ion Stoica, Tri Dao
 # ********************************************************************************
-
-from typing import Callable
+from __future__ import annotations
 
 import torch
 import torch.nn as nn
@@ -142,10 +141,7 @@ class Experts(nn.Module):
         else:
             assert expert_frequency is None
 
-        input = [
-            F.linear(input[i], self.weight[i], None if self.bias is None else self.bias[i])
-            for i in range(self.num_experts)
-        ]
+        input = [F.linear(input[i], self.weight[i], None if self.bias is None else self.bias[i]) for i in range(self.num_experts)]
 
         if not return_list:
             input = torch.cat(input, dim=0)
@@ -153,9 +149,7 @@ class Experts(nn.Module):
         return input
 
     def extra_repr(self):
-        return "num_experts={}, in_features={}, out_features={}".format(
-            self.num_experts, self.in_features, self.out_features
-        )
+        return f"num_experts={self.num_experts}, in_features={self.in_features}, out_features={self.out_features}"
 
     @torch.no_grad()
     def reset_parameters(self) -> None:
@@ -258,9 +252,7 @@ class MoE(nn.Module):
 
     # copied from https://github.com/open-lm-engine/lm-engine/blob/1447883df709727839bbbb367ce727fa56962a6a/lm_engine/hf_models/modeling_utils/mlp_blocks/moe.py#L432-L455
     # NOTE we don't do all_reduce here for expert frequency for simplicity across data parallel workers
-    def _compute_switch_loss(
-        self, logits: torch.Tensor, probs: torch.Tensor, expert_frequency: torch.Tensor
-    ) -> torch.Tensor:
+    def _compute_switch_loss(self, logits: torch.Tensor, probs: torch.Tensor, expert_frequency: torch.Tensor) -> torch.Tensor:
         logits = logits.view(-1, logits.size(-1))
         probs = probs.view(-1, probs.size(-1))
 
@@ -348,9 +340,7 @@ class MoE(nn.Module):
 
             hidden_states = hidden_states[fan_in_index]
 
-            hidden_states = self.c_fc.torch_forward(
-                input=hidden_states, expert_frequency=expert_frequency, return_list=True
-            )
+            hidden_states = self.c_fc.torch_forward(input=hidden_states, expert_frequency=expert_frequency, return_list=True)
 
             hidden_states = [act_func(i) for i in hidden_states]
             hidden_states = self.c_proj.torch_forward(input=hidden_states, expert_frequency=None, return_list=False)
