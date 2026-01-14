@@ -7,7 +7,6 @@ from __future__ import annotations
 import cutlass
 import cutlass.cute as cute
 from cutlass import Boolean, Int32, const_expr
-
 from quack.pipeline import PipelineStateWAdvance
 from quack.tile_scheduler import TileScheduler, VarlenMTileScheduler
 

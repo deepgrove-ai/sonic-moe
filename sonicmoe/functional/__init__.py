@@ -6,10 +6,10 @@ import os
 
 import torch
 import torch.nn.functional as F
-
 from quack.gemm_interface import gemm
 
 from ..count_cumsum import count_cumsum
+from ..enums import ActivationType, is_glu
 from ..quack_utils import gemm_dgated, gemm_gated
 from .backward import _down_projection_backward, _softmax_topk_bwd, _token_broadcast_backward, _up_projection_backward
 from .forward import _down_projection_forward, _router_forward, _softmax_topk_fwd, _up_projection_forward
@@ -17,22 +17,33 @@ from .utils import enable_quack_gemm, is_using_quack_gemm
 
 
 def TC_topk_router_metadata(
-    topk_router_indices: torch.Tensor, expert_offset, K: int
+    topk_router_indices: torch.Tensor, expert_frequency_offset, K: int
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     s_scatter_idx = torch.argsort(topk_router_indices.view(-1)).int()
-    expert_offset = torch.cat([torch.zeros(1, device=expert_offset.device, dtype=expert_offset.dtype), expert_offset])
+    expert_frequency_offset = torch.cat(
+        [
+            torch.zeros(1, device=expert_frequency_offset.device, dtype=expert_frequency_offset.dtype),
+            expert_frequency_offset,
+        ]
+    )
     # s_reverse_scatter_idx = torch.argsort(s_scatter_idx).int()
     s_reverse_scatter_idx = torch.empty_like(s_scatter_idx)
     s_reverse_scatter_idx[s_scatter_idx] = torch.arange(
         s_scatter_idx.shape[0], device=s_scatter_idx.device, dtype=s_scatter_idx.dtype
     )
 
-    topk_x_offset = torch.arange(
+    num_activated_expert_per_token_offset = torch.arange(
         0, topk_router_indices.shape[0] * K + 1, K, dtype=torch.int32, device=topk_router_indices.device
     )
     x_gather_idx = s_scatter_idx // K
 
-    return expert_offset, x_gather_idx, s_scatter_idx, s_reverse_scatter_idx, topk_x_offset
+    return (
+        expert_frequency_offset,
+        x_gather_idx,
+        s_scatter_idx,
+        s_reverse_scatter_idx,
+        num_activated_expert_per_token_offset,
+    )
 
 
 def general_routing_router_metadata(
@@ -41,8 +52,8 @@ def general_routing_router_metadata(
 
     device = router_scores_selected.device
 
-    expert_frequency, expert_offset = count_cumsum(selected_E, E, do_cumsum=True)
-    expert_offset = torch.cat([torch.zeros(1, dtype=torch.int32, device=device), expert_offset])
+    expert_frequency, expert_frequency_offset = count_cumsum(selected_E, E, do_cumsum=True)
+    expert_frequency_offset = torch.cat([torch.zeros(1, dtype=torch.int32, device=device), expert_frequency_offset])
 
     s_scatter_idx = selected_E.argsort().int()
     s_reverse_scatter_idx = torch.empty_like(s_scatter_idx)
@@ -52,14 +63,23 @@ def general_routing_router_metadata(
 
     x_gather_idx = sorted_selected_T[s_scatter_idx]
 
-    if T % 4 == 0:
-        _, topk_token_offset = count_cumsum(sorted_selected_T, T, do_cumsum=True)
+    if T % 4 == 0 and T <= 50000:
+        _, num_activated_expert_per_token_offset = count_cumsum(sorted_selected_T, T, do_cumsum=True)
     else:
-        topk_token_offset = torch.bincount(sorted_selected_T, minlength=T).int()
+        num_activated_expert_per_token_offset = torch.bincount(sorted_selected_T, minlength=T).cumsum(0).int()
 
-    topk_token_offset = torch.cat([torch.zeros(1, dtype=torch.int32, device=device), topk_token_offset])
+    num_activated_expert_per_token_offset = torch.cat(
+        [torch.zeros(1, dtype=torch.int32, device=device), num_activated_expert_per_token_offset]
+    )
 
-    return expert_frequency, expert_offset, x_gather_idx, s_scatter_idx, s_reverse_scatter_idx, topk_token_offset
+    return (
+        expert_frequency,
+        expert_frequency_offset,
+        x_gather_idx,
+        s_scatter_idx,
+        s_reverse_scatter_idx,
+        num_activated_expert_per_token_offset,
+    )
 
 
 class TC_Softmax_Topk_Router_Function(torch.autograd.Function):
@@ -98,35 +118,38 @@ class _UpProjection(torch.autograd.Function):
         x: torch.Tensor,
         w1: torch.Tensor,
         b1: torch.Tensor | None,
-        expert_offset: torch.Tensor,
+        expert_frequency_offset: torch.Tensor,
         total_expert_freq: int,
         K: int,
         stream_id: int,
         x_gather_idx: torch.Tensor,
         s_scatter_idx: torch.Tensor,
         s_reverse_scatter_idx: torch.Tensor,
-        topk_token_offset: torch.Tensor,
+        num_activated_expert_per_token_offset: torch.Tensor,
         is_varlen_K: bool,
+        activation_type: ActivationType,
         is_inference_mode_enabled: bool,
     ) -> torch.Tensor:
         T, H = x.shape
         I, H, E = w1.shape
-        I //= 2
+        is_glu_activation = is_glu(activation_type)
+        if is_glu_activation:
+            I //= 2
         TK = total_expert_freq
 
         if is_using_quack_gemm():
             assert not torch.compiler.is_compiling()
-
+            assert is_glu_activation, "QuACK GEMM does not support non GLU activation yet"
             z, y1 = gemm_gated(
                 x,
                 w1.permute(2, 1, 0),
                 activation="swiglu",
-                cu_seqlens_m=expert_offset,
+                cu_seqlens_m=expert_frequency_offset,
                 A_idx=x_gather_idx,
                 dynamic_scheduler=False,
             )
         else:
-            z = torch.empty(TK, 2 * I, dtype=x.dtype, device=x.device)
+            z = torch.empty(TK, (2 * I if is_glu_activation else I), dtype=x.dtype, device=x.device)
             y1 = torch.empty(TK, I, dtype=x.dtype, device=x.device)
             _up_projection_forward(
                 x=x,
@@ -134,10 +157,12 @@ class _UpProjection(torch.autograd.Function):
                 z=z,
                 y1=y1,
                 b1=b1,
-                expert_offset=expert_offset,
+                expert_frequency_offset=expert_frequency_offset,
                 expert_schedule_order=None,
                 x_gather_idx=x_gather_idx,
                 stream_id=stream_id,
+                activation_type=activation_type.value,
+                is_glu_activation=is_glu_activation,
                 is_inference_mode_enabled=is_inference_mode_enabled,
             )
 
@@ -148,17 +173,18 @@ class _UpProjection(torch.autograd.Function):
         ctx.H = H
         ctx.I = I
         ctx.is_varlen_K = is_varlen_K
+        ctx.is_glu_activation = is_glu_activation
         ctx.stream_id = stream_id
 
         ctx.save_for_backward(
             x,
             w1,
             b1,
-            expert_offset,
+            expert_frequency_offset,
             x_gather_idx,
             s_scatter_idx,
             s_reverse_scatter_idx,
-            topk_token_offset,
+            num_activated_expert_per_token_offset,
         )
 
         ctx.mark_non_differentiable(y1)
@@ -178,6 +204,7 @@ class _UpProjection(torch.autograd.Function):
         E = ctx.E
         K = ctx.K
         H = ctx.H
+        is_glu_activation = ctx.is_glu_activation
         is_varlen_K = ctx.is_varlen_K
         stream_id = ctx.stream_id
 
@@ -185,11 +212,11 @@ class _UpProjection(torch.autograd.Function):
             x,
             w1,
             b1,
-            expert_offset,
+            expert_frequency_offset,
             x_gather_idx,
             s_scatter_idx,
             s_reverse_scatter_idx,
-            topk_token_offset,
+            num_activated_expert_per_token_offset,
         ) = ctx.saved_tensors
 
         dw1 = torch.empty_like(w1)
@@ -202,12 +229,12 @@ class _UpProjection(torch.autograd.Function):
                 x.T,
                 dz,
                 out=dw1.permute(2, 1, 0),
-                cu_seqlens_k=expert_offset,
+                cu_seqlens_k=expert_frequency_offset,
                 A_idx=x_gather_idx,
                 batch_idx_permute=None,
                 dynamic_scheduler=False,
             )
-            dx_expanded = gemm(dz, w1.permute(2, 0, 1), cu_seqlens_m=expert_offset, dynamic_scheduler=False)
+            dx_expanded = gemm(dz, w1.permute(2, 0, 1), cu_seqlens_m=expert_frequency_offset, dynamic_scheduler=False)
         else:
             dx_expanded = torch.empty(TK, H, dtype=dz.dtype, device=dz.device)
             _up_projection_backward(
@@ -217,10 +244,11 @@ class _UpProjection(torch.autograd.Function):
                 dw1=dw1,
                 dz=dz,
                 db1=db1,
-                expert_offset=expert_offset,
+                expert_frequency_offset=expert_frequency_offset,
                 expert_schedule_order=None,
                 x_gather_idx=x_gather_idx,
                 s_scatter_idx=s_scatter_idx,
+                is_glu_activation=is_glu_activation,
                 stream_id=stream_id,
             )
 
@@ -230,13 +258,13 @@ class _UpProjection(torch.autograd.Function):
             dx_reduced=dx_reduced,
             dx_expanded=dx_expanded,
             s_reverse_scatter_idx=s_reverse_scatter_idx,
-            topk_token_offset=topk_token_offset,
+            num_activated_expert_per_token_offset=num_activated_expert_per_token_offset,
             varlen_K_max=(E if is_varlen_K else K),
             H=H,
             is_varlen_K=is_varlen_K,
         )
 
-        return dx_reduced, dw1, db1, *[None] * 10
+        return dx_reduced, dw1, db1, *[None] * 12
 
 
 class _DownProjection(torch.autograd.Function):
@@ -248,15 +276,16 @@ class _DownProjection(torch.autograd.Function):
         w2: torch.Tensor,
         b2: torch.Tensor | None,
         topk_scores: torch.Tensor,
-        expert_offset: torch.Tensor,
+        expert_frequency_offset: torch.Tensor,
         T: int,
         K: int,
         stream_id: int,
         x_gather_idx: torch.Tensor,
         s_scatter_idx: torch.Tensor,
         s_reverse_scatter_idx: torch.Tensor,
-        topk_token_offset: torch.Tensor,
+        num_activated_expert_per_token_offset: torch.Tensor,
         is_varlen_K: bool,
+        activation_type: ActivationType,
     ) -> torch.Tensor:
         TK = y1.size(0)
         H, I, E = w2.shape
@@ -265,7 +294,7 @@ class _DownProjection(torch.autograd.Function):
             assert not torch.compiler.is_compiling()
 
             assert b2 is None
-            y2 = gemm(y1, w2.permute(2, 1, 0), cu_seqlens_m=expert_offset)
+            y2 = gemm(y1, w2.permute(2, 1, 0), cu_seqlens_m=expert_frequency_offset)
         else:
             y2 = torch.empty(TK, H, dtype=y1.dtype, device=y1.device)
             _down_projection_forward(
@@ -273,7 +302,7 @@ class _DownProjection(torch.autograd.Function):
                 y1=y1,
                 y2=y2,
                 b2=b2,
-                expert_offset=expert_offset,
+                expert_frequency_offset=expert_frequency_offset,
                 expert_schedule_order=None,
                 x_gather_idx=x_gather_idx,
                 stream_id=stream_id,
@@ -287,7 +316,7 @@ class _DownProjection(torch.autograd.Function):
             o=o,
             topk_scores=topk_scores,
             s_reverse_scatter_idx=s_reverse_scatter_idx,
-            topk_token_offset=topk_token_offset,
+            num_activated_expert_per_token_offset=num_activated_expert_per_token_offset,
             varlen_K_max=(E if is_varlen_K else K),
             H=H,
             is_varlen_K=is_varlen_K,
@@ -296,6 +325,7 @@ class _DownProjection(torch.autograd.Function):
         ctx.T = T
         ctx.K = K
         ctx.is_varlen_K = is_varlen_K
+        ctx.activation_type = activation_type
         ctx.stream_id = stream_id
 
         ctx.save_for_backward(
@@ -303,7 +333,7 @@ class _DownProjection(torch.autograd.Function):
             w2,
             b2,
             topk_scores,
-            expert_offset,
+            expert_frequency_offset,
             x_gather_idx,
             s_scatter_idx,
             s_reverse_scatter_idx,
@@ -317,13 +347,14 @@ class _DownProjection(torch.autograd.Function):
         K = ctx.K
         stream_id = ctx.stream_id
         is_varlen_K = ctx.is_varlen_K
+        activation_type = ctx.activation_type
 
         (
             z,
             w2,
             b2,
             topk_scores,
-            expert_offset,
+            expert_frequency_offset,
             x_gather_idx,
             s_scatter_idx,
             s_reverse_scatter_idx,
@@ -335,6 +366,7 @@ class _DownProjection(torch.autograd.Function):
 
         if is_using_quack_gemm():
             assert not torch.compiler.is_compiling()
+            assert is_glu(activation_type), "QuACK GEMM does not support non GLU activation yet"
 
             s = topk_scores[s_scatter_idx]
             _, y1s, ds = gemm_dgated(
@@ -345,7 +377,7 @@ class _DownProjection(torch.autograd.Function):
                 dx_out=dz,
                 colvec_scale=s,
                 colvec_reduce=True,
-                cu_seqlens_m=expert_offset,
+                cu_seqlens_m=expert_frequency_offset,
                 A_idx=x_gather_idx,
                 dynamic_scheduler=False,
             )
@@ -353,7 +385,7 @@ class _DownProjection(torch.autograd.Function):
                 dout.T,
                 y1s,
                 out=dw2.permute(2, 0, 1),
-                cu_seqlens_k=expert_offset,
+                cu_seqlens_k=expert_frequency_offset,
                 A_idx=x_gather_idx,
                 batch_idx_permute=None,
                 dynamic_scheduler=False,
@@ -372,18 +404,20 @@ class _DownProjection(torch.autograd.Function):
                 b2=b2,
                 db2=db2,
                 topk_scores=topk_scores,
-                expert_offset=expert_offset,
+                expert_frequency_offset=expert_frequency_offset,
                 expert_schedule_order=None,
                 x_gather_idx=x_gather_idx,
                 s_scatter_idx=s_scatter_idx,
                 stream_id=stream_id,
+                is_glu_activation=is_glu(activation_type),
+                activation_type=activation_type.value,
             )
 
         # TC top-K routing
         if not is_varlen_K:
             ds = ds.view(T, K)
 
-        return None, dz, dw2, db2, ds, *[None] * 9
+        return None, dz, dw2, db2, ds, *[None] * 10
 
 
 def moe_TC_softmax_topk_layer(
@@ -395,6 +429,7 @@ def moe_TC_softmax_topk_layer(
     b2: torch.Tensor | None,
     K: int,
     stream_id: int,
+    activation_type: ActivationType | str = ActivationType.SWIGLU,
     is_inference_mode_enabled: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     assert ((b1 is None) and (b2 is None)) or (
@@ -402,27 +437,35 @@ def moe_TC_softmax_topk_layer(
     ), "b1 and b2 has to be None or not None at the same time!"
     router_logits = F.linear(x, router_w)
     topk_scores, topk_indices = TC_Softmax_Topk_Router_Function.apply(router_logits, router_w.size(0), K)
-    expert_frequency, expert_offset = count_cumsum(topk_indices.view(-1), router_w.size(0), do_cumsum=True)
+    expert_frequency, expert_frequency_offset = count_cumsum(topk_indices.view(-1), router_w.size(0), do_cumsum=True)
 
-    expert_offset, x_gather_idx, s_scatter_idx, s_reverse_scatter_idx, topk_token_offset = TC_topk_router_metadata(
-        topk_indices, expert_offset, K
-    )
+    (
+        expert_frequency_offset,
+        x_gather_idx,
+        s_scatter_idx,
+        s_reverse_scatter_idx,
+        num_activated_expert_per_token_offset,
+    ) = TC_topk_router_metadata(topk_indices, expert_frequency_offset, K)
 
     T = x.size(0)
+
+    if type(activation_type) == str:
+        activation_type = ActivationType(activation_type)
 
     y1, z = _UpProjection.apply(
         x,
         w1,
         b1,
-        expert_offset,
+        expert_frequency_offset,
         T * K,
         K,
         stream_id,
         x_gather_idx,
         s_scatter_idx,
         s_reverse_scatter_idx,
-        topk_token_offset,
+        num_activated_expert_per_token_offset,
         False,  # is_varlen_K
+        activation_type,
         is_inference_mode_enabled,
     )
 
@@ -432,35 +475,41 @@ def moe_TC_softmax_topk_layer(
         w2,
         b2,
         topk_scores,
-        expert_offset,
+        expert_frequency_offset,
         T,
         K,
         stream_id,
         x_gather_idx,
         s_scatter_idx,
         s_reverse_scatter_idx,
-        topk_token_offset,
+        num_activated_expert_per_token_offset,
         False,  # is_varlen_K
+        activation_type,
     )
 
     return o, router_logits, expert_frequency
 
 
 # !!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
-# We assume sorted_selected_T is already SORTED ascendingly !!!
-#   and len(sorted_selected_T) = len(selected_E) = len(router_scores_selected)
+# Weight format requirements:
+# - w1_weight: Shape (2*I, H, E), stride order (2, 0, 1), must be interleaved [gate_row0, up_row0, gate_row1, up_row1, ...]
+# - w2_weight: Shape (H, I, E), stride order (2, 0, 1)
+# 
+# We assume token_indices is already SORTED ascendingly !!!
+#   and len(token_indices) = len(expert_indices) = len(router_scores)
 # !!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
 def moe_general_routing_inputs(
     x: torch.Tensor,
-    router_scores_selected: torch.Tensor,
-    sorted_selected_T: torch.Tensor,
-    selected_E: torch.Tensor,
+    router_scores: torch.Tensor,
+    token_indices: torch.Tensor,
+    expert_indices: torch.Tensor,
     w1: torch.Tensor,
     b1: torch.Tensor | None,
     w2: torch.Tensor,
     b2: torch.Tensor | None,
     E: int,
     stream_id: int,
+    activation_type: ActivationType,
     is_inference_mode_enabled: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     assert ((b1 is None) and (b2 is None)) or (
@@ -468,25 +517,31 @@ def moe_general_routing_inputs(
     ), "b1 and b2 has to be None or not None at the same time!"
 
     T = x.size(0)
-    TK = router_scores_selected.size(0)
+    TK = router_scores.size(0)
     E = w2.size(-1)
-    (expert_frequency, expert_offset, x_gather_idx, s_scatter_idx, s_reverse_scatter_idx, topk_token_offset) = (
-        general_routing_router_metadata(router_scores_selected, sorted_selected_T, selected_E, T, E)
-    )
+    (
+        expert_frequency,
+        expert_frequency_offset,
+        x_gather_idx,
+        s_scatter_idx,
+        s_reverse_scatter_idx,
+        num_activated_expert_per_token_offset,
+    ) = general_routing_router_metadata(router_scores, token_indices, expert_indices, T, E)
 
     y1, z = _UpProjection.apply(
         x,
         w1,
         b1,
-        expert_offset,
+        expert_frequency_offset,
         TK,
         None,  # K, not needed
         stream_id,
         x_gather_idx,
         s_scatter_idx,
         s_reverse_scatter_idx,
-        topk_token_offset,
+        num_activated_expert_per_token_offset,
         True,  # is_varlen_K
+        activation_type,
         is_inference_mode_enabled,
     )
 
@@ -495,16 +550,17 @@ def moe_general_routing_inputs(
         z,
         w2,
         b2,
-        router_scores_selected,
-        expert_offset,
+        router_scores,
+        expert_frequency_offset,
         T,
         None,  # K, not needed
         stream_id,
         x_gather_idx,
         s_scatter_idx,
         s_reverse_scatter_idx,
-        topk_token_offset,
+        num_activated_expert_per_token_offset,
         True,  # is_varlen_K
+        activation_type,
     )
 
     return o, expert_frequency

@@ -7,11 +7,10 @@ from typing import Optional
 import cuda.bindings.driver as cuda
 import cutlass.cute as cute
 import torch
-
 import triton
 import triton.language as tl
 
-from ..enums import LIBRARY_NAME, TENSORMAP
+from ..enums import LIBRARY_NAME, TENSORMAP, ActivationType, is_glu
 from ..utils import ceil_divide, convert_torch_tensor_to_cute_tensor, get_powers_of_2
 from .moe_config import (
     HopperWgmma_MoE_Down_proj_ActGrad_Bwd,
@@ -201,41 +200,43 @@ def _up_projection_backward(
     dw1: torch.Tensor,
     dz: torch.Tensor,
     db1: torch.Tensor | None,
-    expert_offset: torch.Tensor,
+    expert_frequency_offset: torch.Tensor,
     expert_schedule_order: torch.Tensor,
     x_gather_idx: torch.Tensor,
     s_scatter_idx: torch.Tensor,
+    is_glu_activation: bool,
     stream_id: int,
 ) -> None:
     I, H, E = w1.size()
-    I //= 2
+    if is_glu_activation:
+        I //= 2
 
     x = x.detach()
 
     # db1 computation, change it later
     if db1 is not None:
-        db1_kernel[(E,)](dz, db1, expert_offset, 2 * I, E)
+        db1_kernel[(E,)](dz, db1, expert_frequency_offset, (2 * I if is_glu_activation else I), E)
 
-    mDz_trans = convert_torch_tensor_to_cute_tensor(dz.T, (1, 0), 0, 16, 8)
-    mDw1_trans = convert_torch_tensor_to_cute_tensor(dw1.permute(1, 0, 2), (2, 1, 0), 0, 16, 8)
+    mDz_trans = convert_torch_tensor_to_cute_tensor(dz.T, (1, 0), 0, 16, 8, stream=stream_id)
+    mDw1_trans = convert_torch_tensor_to_cute_tensor(dw1.permute(1, 0, 2), (2, 1, 0), 0, 16, 8, stream=stream_id)
 
-    mX_trans = convert_torch_tensor_to_cute_tensor(x.T, (1, 0), 0, 16, 8)
-    mE_offset = convert_torch_tensor_to_cute_tensor(expert_offset, (0,), 0, 4, 1)
-    mX_gather = convert_torch_tensor_to_cute_tensor(x_gather_idx, (0,), 0, 4, 1)
-    mS_scatter = convert_torch_tensor_to_cute_tensor(s_scatter_idx, (0,), 0, 4, 1)
-    mDz = convert_torch_tensor_to_cute_tensor(dz, (0, 1), 1, 16, 8)
-    mDx_expanded = convert_torch_tensor_to_cute_tensor(dx_expanded, (0, 1), 1, 16, 8)
-    mW1_trans = convert_torch_tensor_to_cute_tensor(w1.permute(1, 0, 2), (2, 1, 0), 0, 16, 8)
+    mX_trans = convert_torch_tensor_to_cute_tensor(x.T, (1, 0), 0, 16, 8, stream=stream_id)
+    mE_offset = convert_torch_tensor_to_cute_tensor(expert_frequency_offset, (0,), 0, 4, 1, stream=stream_id)
+    mX_gather = convert_torch_tensor_to_cute_tensor(x_gather_idx, (0,), 0, 4, 1, stream=stream_id)
+    mS_scatter = convert_torch_tensor_to_cute_tensor(s_scatter_idx, (0,), 0, 4, 1, stream=stream_id)
+    mDz = convert_torch_tensor_to_cute_tensor(dz, (0, 1), 1, 16, 8, stream=stream_id)
+    mDx_expanded = convert_torch_tensor_to_cute_tensor(dx_expanded, (0, 1), 1, 16, 8, stream=stream_id)
+    mW1_trans = convert_torch_tensor_to_cute_tensor(w1.permute(1, 0, 2), (2, 1, 0), 0, 16, 8, stream=stream_id)
 
     if expert_schedule_order is None:
         mE_permute_order = None
     else:
-        mE_permute_order = convert_torch_tensor_to_cute_tensor(expert_schedule_order, (0,), 0, 4, 1)
+        mE_permute_order = convert_torch_tensor_to_cute_tensor(expert_schedule_order, (0,), 0, 4, 1, stream=stream_id)
     current_stream = cuda.CUstream(stream_id)
 
-    compile_dw1_key = ("dw1", E, H, I, x.dtype)
+    compile_dw1_key = ("dw1", E, H, I, is_glu_activation, x.dtype)
     if compile_dw1_key not in _up_projection_backward.compile_cache:
-        dw1_module = HopperWgmma_MoE_Up_proj_WeightGrad_Bwd(E, H, I)
+        dw1_module = HopperWgmma_MoE_Up_proj_WeightGrad_Bwd(E, H, I, is_glu_activation)
         tensormaps = [dw1_module.module.generate_tensormap(None, None, None) for _ in range(1)]
         _up_projection_backward.compile_cache[compile_dw1_key] = cute.compile(
             dw1_module,
@@ -255,9 +256,9 @@ def _up_projection_backward(
         mX_trans, mDz_trans, mDw1_trans, mE_offset, mX_gather, dw1_tensormaps, mE_permute_order, current_stream
     )
 
-    compile_dx_key = ("dx", E, H, I, x.dtype)
+    compile_dx_key = ("dx", E, H, I, is_glu, x.dtype)
     if compile_dx_key not in _up_projection_backward.compile_cache:
-        dx_module = HopperWgmma_MoE_Up_proj_ActGrad_Bwd(E, H, I)
+        dx_module = HopperWgmma_MoE_Up_proj_ActGrad_Bwd(E, H, I, is_glu_activation)
         tensormaps = [dx_module.module.generate_tensormap(None, None, None) for _ in range(2)]
         _up_projection_backward.compile_cache[compile_dx_key] = cute.compile(
             dx_module,
@@ -293,11 +294,13 @@ def _down_projection_backward(
     b2: torch.Tensor | None,
     db2: torch.Tensor | None,
     topk_scores: torch.Tensor,
-    expert_offset: torch.Tensor,
+    expert_frequency_offset: torch.Tensor,
     expert_schedule_order: torch.Tensor,
     x_gather_idx: torch.Tensor,
     s_scatter_idx: torch.Tensor,
     stream_id: int,
+    is_glu_activation: bool,
+    activation_type: str,
 ) -> None:
     H, I, E = w2.size()
     TK = x_gather_idx.size(0)
@@ -308,44 +311,53 @@ def _down_projection_backward(
     w2 = w2.detach()
     topk_scores = topk_scores.detach()
 
-    mDout = convert_torch_tensor_to_cute_tensor(dout, (0, 1), 1, 16, 8)
-    mDout_trans = convert_torch_tensor_to_cute_tensor(dout.T, (1, 0), 0, 16, 8)
-    mDz_FP32 = convert_torch_tensor_to_cute_tensor(dz.view(torch.float32), (0, 1), 1, 16, 8)
-    mDw2 = convert_torch_tensor_to_cute_tensor(dw2, (2, 0, 1), 1, 16, 8)
-    mW2_trans = convert_torch_tensor_to_cute_tensor(w2.permute(1, 0, 2), (2, 1, 0), 0, 16, 8)
-    mS = convert_torch_tensor_to_cute_tensor(topk_scores, (0,), 0, 4, 1)
-    mZ_FP32 = convert_torch_tensor_to_cute_tensor(z.view(torch.float32), (0, 1), 1, 16, 8)
-    mY1S = convert_torch_tensor_to_cute_tensor(y1s, (0, 1), 1, 16, 8)
-    mY1S_trans = convert_torch_tensor_to_cute_tensor(y1s.T, (1, 0), 0, 16, 8)
-    mE_offset = convert_torch_tensor_to_cute_tensor(expert_offset, (0,), 0, 4, 1)
-    mX_gather = convert_torch_tensor_to_cute_tensor(x_gather_idx, (0,), 0, 4, 1)
-    mS_scatter = convert_torch_tensor_to_cute_tensor(s_scatter_idx, (0,), 0, 4, 1)
+    mDout = convert_torch_tensor_to_cute_tensor(dout, (0, 1), 1, 16, 8, stream=stream_id)
+    mDout_trans = convert_torch_tensor_to_cute_tensor(dout.T, (1, 0), 0, 16, 8, stream=stream_id)
+    mDw2 = convert_torch_tensor_to_cute_tensor(dw2, (2, 0, 1), 1, 16, 8, stream=stream_id)
+    mW2_trans = convert_torch_tensor_to_cute_tensor(w2.permute(1, 0, 2), (2, 1, 0), 0, 16, 8, stream=stream_id)
+    mS = convert_torch_tensor_to_cute_tensor(topk_scores, (0,), 0, 4, 1, stream=stream_id)
+    if is_glu_activation:
+        mDz_kernel_input = convert_torch_tensor_to_cute_tensor(
+            dz.view(torch.float32), (0, 1), 1, 16, 8, stream=stream_id
+        )
+        mZ_kernel_input = convert_torch_tensor_to_cute_tensor(
+            z.view(torch.float32), (0, 1), 1, 16, 8, stream=stream_id
+        )
+    else:
+        mDz_kernel_input = convert_torch_tensor_to_cute_tensor(dz.detach(), (0, 1), 1, 16, 8, stream=stream_id)
+        mZ_kernel_input = convert_torch_tensor_to_cute_tensor(z.detach(), (0, 1), 1, 16, 8, stream=stream_id)
+
+    mY1S = convert_torch_tensor_to_cute_tensor(y1s, (0, 1), 1, 16, 8, stream=stream_id)
+    mY1S_trans = convert_torch_tensor_to_cute_tensor(y1s.T, (1, 0), 0, 16, 8, stream=stream_id)
+    mE_offset = convert_torch_tensor_to_cute_tensor(expert_frequency_offset, (0,), 0, 4, 1, stream=stream_id)
+    mX_gather = convert_torch_tensor_to_cute_tensor(x_gather_idx, (0,), 0, 4, 1, stream=stream_id)
+    mS_scatter = convert_torch_tensor_to_cute_tensor(s_scatter_idx, (0,), 0, 4, 1, stream=stream_id)
 
     if expert_schedule_order is None:
         mE_permute_order = None
     else:
-        mE_permute_order = convert_torch_tensor_to_cute_tensor(expert_schedule_order, (0,), 0, 4, 1)
+        mE_permute_order = convert_torch_tensor_to_cute_tensor(expert_schedule_order, (0,), 0, 4, 1, stream=stream_id)
     current_stream = cuda.CUstream(stream_id)
     ds_partial = None
 
-    compile_dz_key = ("dz", E, H, I, z.dtype)
+    compile_dz_key = ("dz", E, H, I, z.dtype, activation_type)
     if compile_dz_key not in _down_projection_backward.compile_cache:
         # I don't know why but this sync appears to fix a mysterious initialization bug??
         torch.cuda.synchronize()
-        dz_module = HopperWgmma_MoE_Down_proj_ActGrad_Bwd(E, H, I)
+        dz_module = HopperWgmma_MoE_Down_proj_ActGrad_Bwd(E, H, I, ActivationType(activation_type))
         tensormaps = [dz_module.module.generate_tensormap(None, None, None) for _ in range(3)]
 
         ds_partial_N = max(ceil_divide(I, dz_module.module.tile_shape_mnk[1]), 1)
         ds_partial = torch.empty(TK, ds_partial_N, dtype=torch.float32, device=topk_scores.device)
-        mDS_partial = convert_torch_tensor_to_cute_tensor(ds_partial, (0, 1), 1, 4, 1)
+        mDS_partial = convert_torch_tensor_to_cute_tensor(ds_partial, (0, 1), 1, 4, 1, stream=stream_id)
 
         _down_projection_backward.compile_cache["ds_partial_N"] = ds_partial_N
         _down_projection_backward.compile_cache[compile_dz_key] = cute.compile(
             dz_module,
             mDout,
             mW2_trans,
-            mZ_FP32,
-            mDz_FP32,
+            mZ_kernel_input,
+            mDz_kernel_input,
             mY1S,
             mS,
             mDS_partial,
@@ -361,14 +373,14 @@ def _down_projection_backward(
     if ds_partial is None:
         ds_partial_N = _down_projection_backward.compile_cache["ds_partial_N"]
         ds_partial = torch.empty(TK, ds_partial_N, dtype=torch.float32, device=topk_scores.device)
-        mDS_partial = convert_torch_tensor_to_cute_tensor(ds_partial, (0, 1), 1, 4, 1)
+        mDS_partial = convert_torch_tensor_to_cute_tensor(ds_partial, (0, 1), 1, 4, 1, stream=stream_id)
 
     dz_tensormaps = _down_projection_backward.compile_cache[f"dz-{TENSORMAP}"]
     _down_projection_backward.compile_cache[compile_dz_key](
         mDout,
         mW2_trans,
-        mZ_FP32,
-        mDz_FP32,
+        mZ_kernel_input,
+        mDz_kernel_input,
         mY1S,
         mS,
         mDS_partial,
@@ -414,7 +426,7 @@ def _down_projection_backward(
             db2,
             x_gather_idx,
             s_scatter_idx,
-            expert_offset,
+            expert_frequency_offset,
             H,
             E,
             ds_partial_N,
@@ -427,7 +439,7 @@ def _down_projection_backward(
         else:
             ds.copy_(new_ds_partial.sum(dim=-1, dtype=ds.dtype))
 
-    compile_dw2_key = ("dw2", E, H, I, dw2.dtype)
+    compile_dw2_key = ("dw2", E, H, I, activation_type, dw2.dtype)
     if compile_dw2_key not in _down_projection_backward.compile_cache:
         dw2_module = HopperWgmma_MoE_Down_proj_WeightGrad_Bwd(E, H, I)
         tensormaps = [dw2_module.module.generate_tensormap(None, None, None) for _ in range(1)]
@@ -458,7 +470,7 @@ def _token_broadcast_backward(
     dx_reduced: torch.Tensor,
     dx_expanded: torch.Tensor,
     s_reverse_scatter_idx: torch.Tensor,
-    topk_token_offset: torch.Tensor,
+    num_activated_expert_per_token_offset: torch.Tensor,
     varlen_K_max: int,
     H: int,
     is_varlen_K: bool,
@@ -468,7 +480,7 @@ def _token_broadcast_backward(
         None,
         dx_reduced,
         s_reverse_scatter_idx,
-        topk_token_offset,
+        num_activated_expert_per_token_offset,
         dx_reduced.size(0),
         varlen_K_max,
         H,

@@ -11,18 +11,19 @@ import torch
 import torch.nn.functional as F
 from rich import print as print0
 from tqdm.auto import tqdm
+from triton.testing import do_bench
 
 from sonicmoe import MoE
+from sonicmoe.enums import ActivationType
 from sonicmoe.functional import count_cumsum, moe_general_routing_inputs
-from triton.testing import do_bench
 
 
 @torch.autocast(device_type="cuda", dtype=torch.float32)
 def ref_moe_token_rounding(
     x: torch.Tensor,
-    router_scores_selected: torch.Tensor,
-    selected_T: torch.Tensor,
-    selected_E: torch.Tensor,
+    router_scores: torch.Tensor,
+    token_indices: torch.Tensor,
+    expert_indices: torch.Tensor,
     w1: torch.Tensor,
     b1: torch.Tensor | None,
     w2: torch.Tensor,
@@ -34,8 +35,8 @@ def ref_moe_token_rounding(
     ref_o = torch.zeros_like(x, dtype=torch.float32)
 
     for i in range(E):
-        pos = selected_E == i
-        T_idx = selected_T[pos]
+        pos = expert_indices == i
+        T_idx = token_indices[pos]
 
         if T_idx.numel() > 0:
 
@@ -44,7 +45,7 @@ def ref_moe_token_rounding(
 
             w2_out = F.linear(w1_out, w2[i, :, :].squeeze(), bias=(b2[i] if b2 is not None else None))
 
-            ref_o[T_idx, :] += w2_out * router_scores_selected[pos, None]
+            ref_o[T_idx, :] += w2_out * router_scores[pos, None]
 
     return ref_o.view(T, D)
 
@@ -99,17 +100,39 @@ def parse_arguments() -> argparse.Namespace:
     return args
 
 
-def our_e2e_fwd_bwd_call(x, router_scores_selected, sorted_selected_T, selected_E, w1, b1, w2, b2, E, stream_id, dout):
+def our_e2e_fwd_bwd_call(x, router_scores, token_indices, expert_indices, w1, b1, w2, b2, E, stream_id, dout):
     o, _ = moe_general_routing_inputs(
-        x, router_scores_selected, sorted_selected_T, selected_E, w1, b1, w2, b2, E, stream_id, False
+        x,
+        router_scores,
+        token_indices,
+        expert_indices,
+        w1,
+        b1,
+        w2,
+        b2,
+        E,
+        stream_id,
+        ActivationType.SWIGLU,
+        False,
     )
-    torch.autograd.grad(o, [x, router_scores_selected, w1, w2], dout, retain_graph=True)
-    router_scores_selected.grad = x.grad = w1.grad = w2.grad = None
+    torch.autograd.grad(o, [x, router_scores, w1, w2], dout, retain_graph=True)
+    router_scores.grad = x.grad = w1.grad = w2.grad = None
 
 
-def our_fwd_call(x, router_scores_selected, sorted_selected_T, selected_E, w1, b1, w2, b2, E, stream_id):
+def our_fwd_call(x, router_scores, token_indices, expert_indices, w1, b1, w2, b2, E, stream_id):
     return moe_general_routing_inputs(
-        x, router_scores_selected, sorted_selected_T, selected_E, w1, b1, w2, b2, E, stream_id, False
+        x,
+        router_scores,
+        token_indices,
+        expert_indices,
+        w1,
+        b1,
+        w2,
+        b2,
+        E,
+        stream_id,
+        ActivationType.SWIGLU,
+        False,
     )
 
 
@@ -157,15 +180,15 @@ def forward_token_choice_rounding(
 
     expert_freq_mask = torch.arange(T, device=device, dtype=torch.int32)[:, None].expand(-1, E) < expert_freq_rounded[None, :]  # type: ignore
 
-    selected_T = topk_indices[expert_freq_mask]
-    selected_E = torch.arange(E, device=device, dtype=torch.int32)[None, :].expand(T, -1)[expert_freq_mask]  # type: ignore
+    token_indices = topk_indices[expert_freq_mask]
+    expert_indices = torch.arange(E, device=device, dtype=torch.int32)[None, :].expand(T, -1)[expert_freq_mask]  # type: ignore
 
     # implicit assumption: selected_T should be sorted in my reduction code
-    selected_T_order = selected_T.argsort().int()
-    selected_T = selected_T[selected_T_order]
-    selected_E = selected_E[selected_T_order]
+    token_indices_order = token_indices.argsort().int()
+    token_indices = token_indices[token_indices_order]
+    expert_indices = expert_indices[token_indices_order]
 
-    return router_scores[selected_T, selected_E].contiguous(), selected_T, selected_E
+    return router_scores[token_indices, expert_indices].contiguous(), token_indices, expert_indices
 
 
 def forward_topk(x: torch.Tensor, router_w: torch.Tensor, E, K) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
@@ -218,7 +241,7 @@ def run(
             num_experts_per_tok=K,
             hidden_size=H,
             intermediate_size=I,
-            is_glu=True,
+            activation_function=ActivationType.SWIGLU,
             add_bias=add_bias,
             std=0.02,
         )
@@ -248,25 +271,26 @@ def run(
         dout_clone.requires_grad_(True)
 
         if routing == "top_k":
-            router_scores_selected, selected_T, selected_E = forward_topk(x, router_w, E, K)
-            router_scores_selected_clone, _, _ = forward_topk(x_clone, router_w, E, K)
+            router_scores, token_indices, expert_indices = forward_topk(x, router_w, E, K)
+            router_scores_clone, _, _ = forward_topk(x_clone, router_w, E, K)
         else:
-            router_scores_selected, selected_T, selected_E = forward_token_choice_rounding(
+            router_scores, token_indices, expert_indices = forward_token_choice_rounding(
                 x, router_w, E, K, Mtile, routing
             )
-            router_scores_selected_clone, _, _ = forward_token_choice_rounding(x_clone, router_w, E, K, Mtile, routing)
+            router_scores_clone, _, _ = forward_token_choice_rounding(x_clone, router_w, E, K, Mtile, routing)
 
         o, expert_frequency = moe_general_routing_inputs(
             x,
-            router_scores_selected,
-            selected_T,
-            selected_E,
+            router_scores,
+            token_indices,
+            expert_indices,
             w1.permute(1, 2, 0),
             b1,
             w2.permute(1, 2, 0),
             b2,
             E,
             stream_id,
+            ActivationType.SWIGLU,
             False,
         )
         if add_bias:
@@ -278,16 +302,16 @@ def run(
 
         ref_o = ref_moe_token_rounding(
             x_clone,
-            router_scores_selected_clone,
-            selected_T,
-            selected_E,
+            router_scores_clone,
+            token_indices,
+            expert_indices,
             w1,
             b1,
             w2,
             b2,
             E,
         )
-        ref_expert_frequency = selected_E.view(-1).bincount(minlength=E)
+        ref_expert_frequency = expert_indices.view(-1).bincount(minlength=E)
 
         torch.testing.assert_close(expert_frequency.int(), ref_expert_frequency.int())
 
@@ -340,17 +364,17 @@ def run(
         dout = 0.2 * torch.randn_like(x, requires_grad=True)
 
         if routing == "top_k":
-            router_scores_selected, selected_T, selected_E = forward_topk(x, router_w.detach(), E, K)
+            router_scores, token_indices, expert_indices = forward_topk(x, router_w.detach(), E, K)
         else:
-            router_scores_selected, selected_T, selected_E = forward_token_choice_rounding(
+            router_scores, token_indices, expert_indices = forward_token_choice_rounding(
                 x, router_w.detach(), E, K, Mtile, routing
             )
 
         our_e2e_fwd_bwd_call(
             x,
-            router_scores_selected,
-            selected_T,
-            selected_E,
+            router_scores,
+            token_indices,
+            expert_indices,
             w1.permute(1, 2, 0),
             b1,
             w2.permute(1, 2, 0),
@@ -360,14 +384,14 @@ def run(
             dout,
         )
 
-        TK = router_scores_selected.shape[0]
+        TK = router_scores.shape[0]
 
         forward_time = do_bench(
             lambda: our_fwd_call(
                 x,
-                router_scores_selected,
-                selected_T,
-                selected_E,
+                router_scores,
+                token_indices,
+                expert_indices,
                 w1.permute(1, 2, 0),
                 b1,
                 w2.permute(1, 2, 0),
@@ -388,9 +412,9 @@ def run(
         e2e_time = do_bench(
             lambda: our_e2e_fwd_bwd_call(
                 x,
-                router_scores_selected,
-                selected_T,
-                selected_E,
+                router_scores,
+                token_indices,
+                expert_indices,
                 w1.permute(1, 2, 0),
                 b1,
                 w2.permute(1, 2, 0),
@@ -415,7 +439,7 @@ def run(
         avg_time[2] += bwd_time
         avg_tflops[2] += tflops
 
-        expert_frequency = torch.bincount(selected_E).int()
+        expert_frequency = torch.bincount(expert_indices).int()
         total_processed_tokens += expert_frequency.sum().item()
         total_hardware_tokens += (torch.ceil(expert_frequency / Mtile).to(torch.int32) * Mtile).sum().sum().item()
 

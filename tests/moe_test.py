@@ -6,6 +6,7 @@ import torch
 from parameterized import parameterized
 
 from sonicmoe import KernelBackendMoE, MoE, enable_quack_gemm
+from sonicmoe.enums import ActivationType
 
 from .test_commons import TestCommons
 
@@ -63,7 +64,7 @@ class MoETest(TestCommons):
                 num_experts_per_tok=K,
                 hidden_size=H,
                 intermediate_size=I,
-                is_glu=True,
+                activation_function=ActivationType.SWIGLU,
                 add_bias=add_bias,
                 std=0.02,
             ).to(dtype=dtype)

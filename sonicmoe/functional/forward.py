@@ -5,13 +5,12 @@
 import cuda.bindings.driver as cuda
 import cutlass.cute as cute
 import torch
-from cutlass.cute.runtime import from_dlpack
-
 import triton
 import triton.language as tl
+from cutlass.cute.runtime import from_dlpack
 from quack.cute_dsl_utils import torch2cute_dtype_map
 
-from ..enums import LIBRARY_NAME, TENSORMAP
+from ..enums import LIBRARY_NAME, TENSORMAP, ActivationType
 from ..utils import convert_torch_tensor_to_cute_tensor
 from .moe_config import HopperWgmma_MoE_Down_proj_Fwd, HopperWgmma_MoE_Up_proj_Fwd
 from .reduction_over_k_gather import token_gather_and_sum_varlen_K_triton
@@ -58,37 +57,42 @@ def _up_projection_forward(
     z: torch.Tensor,
     y1: torch.Tensor,
     b1: torch.Tensor | None,
-    expert_offset: torch.Tensor,
+    expert_frequency_offset: torch.Tensor,
     expert_schedule_order: torch.Tensor,
     x_gather_idx: torch.Tensor,
     stream_id: int,
+    activation_type: str,
+    is_glu_activation: bool,
     is_inference_mode_enabled: bool = False,
 ) -> None:
     I, H, E = w1.size()
-    I //= 2
+    if is_glu_activation:
+        I //= 2
 
-    mX = convert_torch_tensor_to_cute_tensor(x.detach(), (0, 1), 1, 16, 8)
-    mW1 = convert_torch_tensor_to_cute_tensor(w1.detach(), (2, 0, 1), 1, 16, 8)
-    mZ = convert_torch_tensor_to_cute_tensor(z, (0, 1), 1, 16, 8)
-    mY1 = convert_torch_tensor_to_cute_tensor(y1, (0, 1), 1, 16, 8)
-    mE_offset = convert_torch_tensor_to_cute_tensor(expert_offset, (0,), 0, 4, 1)
-    mX_gather = convert_torch_tensor_to_cute_tensor(x_gather_idx, (0,), 0, 4, 1)
+    mX = convert_torch_tensor_to_cute_tensor(x.detach(), (0, 1), 1, 16, 8, stream=stream_id)
+    mW1 = convert_torch_tensor_to_cute_tensor(w1.detach(), (2, 0, 1), 1, 16, 8, stream=stream_id)
+    mZ = convert_torch_tensor_to_cute_tensor(z, (0, 1), 1, 16, 8, stream=stream_id)
+    mY1 = convert_torch_tensor_to_cute_tensor(y1, (0, 1), 1, 16, 8, stream=stream_id)
+    mE_offset = convert_torch_tensor_to_cute_tensor(expert_frequency_offset, (0,), 0, 4, 1, stream=stream_id)
+    mX_gather = convert_torch_tensor_to_cute_tensor(x_gather_idx, (0,), 0, 4, 1, stream=stream_id)
 
     if expert_schedule_order is None:
         mE_permute_order = None
     else:
-        mE_permute_order = convert_torch_tensor_to_cute_tensor(expert_schedule_order, (0,), 0, 4, 1)
+        mE_permute_order = convert_torch_tensor_to_cute_tensor(expert_schedule_order, (0,), 0, 4, 1, stream=stream_id)
 
     if b1 is None:
         mB1 = None
     else:
-        mB1 = convert_torch_tensor_to_cute_tensor(b1.detach(), (0, 1), 1, 16, 8)
+        mB1 = convert_torch_tensor_to_cute_tensor(b1.detach(), (0, 1), 1, 16, 8, stream=stream_id)
 
     current_stream = cuda.CUstream(stream_id)
 
-    compile_w1_key = (E, H, I, (b1 is None), x.dtype, is_inference_mode_enabled)
+    compile_w1_key = (E, H, I, (b1 is None), x.dtype, activation_type, is_inference_mode_enabled)
     if compile_w1_key not in _up_projection_forward.compile_cache:
-        w1_module = HopperWgmma_MoE_Up_proj_Fwd(E, H, I, inference_mode=is_inference_mode_enabled)
+        w1_module = HopperWgmma_MoE_Up_proj_Fwd(
+            E, H, I, activation_type=ActivationType(activation_type), inference_mode=is_inference_mode_enabled
+        )
         tensormaps = [w1_module.module.generate_tensormap(None, None, None) for _ in range(2)]
         _up_projection_forward.compile_cache[compile_w1_key] = cute.compile(
             w1_module,
@@ -131,28 +135,28 @@ def _down_projection_forward(
     y1: torch.Tensor,
     y2: torch.Tensor,
     b2: torch.Tensor | None,
-    expert_offset: torch.Tensor,
+    expert_frequency_offset: torch.Tensor,
     expert_schedule_order: torch.Tensor,
     x_gather_idx: torch.Tensor,
     stream_id: int,
 ) -> None:
     H, I, E = w2.size()
 
-    mW2 = convert_torch_tensor_to_cute_tensor(w2.detach(), (2, 0, 1), 1, 16, 8)
-    mY1 = convert_torch_tensor_to_cute_tensor(y1.detach(), (0, 1), 1, 16, 8)
-    mY2 = convert_torch_tensor_to_cute_tensor(y2, (0, 1), 1, 16, 8)
-    mE_offset = convert_torch_tensor_to_cute_tensor(expert_offset, (0,), 0, 4, 1)
-    mX_gather = convert_torch_tensor_to_cute_tensor(x_gather_idx, (0,), 0, 4, 1)
+    mW2 = convert_torch_tensor_to_cute_tensor(w2.detach(), (2, 0, 1), 1, 16, 8, stream=stream_id)
+    mY1 = convert_torch_tensor_to_cute_tensor(y1.detach(), (0, 1), 1, 16, 8, stream=stream_id)
+    mY2 = convert_torch_tensor_to_cute_tensor(y2, (0, 1), 1, 16, 8, stream=stream_id)
+    mE_offset = convert_torch_tensor_to_cute_tensor(expert_frequency_offset, (0,), 0, 4, 1, stream=stream_id)
+    mX_gather = convert_torch_tensor_to_cute_tensor(x_gather_idx, (0,), 0, 4, 1, stream=stream_id)
 
     if expert_schedule_order is None:
         mE_permute_order = None
     else:
-        mE_permute_order = convert_torch_tensor_to_cute_tensor(expert_schedule_order, (0,), 0, 4, 1)
+        mE_permute_order = convert_torch_tensor_to_cute_tensor(expert_schedule_order, (0,), 0, 4, 1, stream=stream_id)
 
     if b2 is None:
         mB2 = None
     else:
-        mB2 = convert_torch_tensor_to_cute_tensor(b2.detach(), (0, 1), 1, 16, 8)
+        mB2 = convert_torch_tensor_to_cute_tensor(b2.detach(), (0, 1), 1, 16, 8, stream=stream_id)
 
     current_stream = cuda.CUstream(stream_id)
 
@@ -180,13 +184,21 @@ def _router_forward(
     o: torch.Tensor,
     topk_scores: torch.Tensor,
     s_reverse_scatter_idx: torch.Tensor,
-    topk_token_offset: torch.Tensor,
+    num_activated_expert_per_token_offset: torch.Tensor,
     varlen_K_max: int,
     H: int,
     is_varlen_K: bool,
 ) -> None:
     token_gather_and_sum_varlen_K_triton(
-        y2, topk_scores, o, s_reverse_scatter_idx, topk_token_offset, o.size(0), varlen_K_max, H, is_varlen_K
+        y2,
+        topk_scores,
+        o,
+        s_reverse_scatter_idx,
+        num_activated_expert_per_token_offset,
+        o.size(0),
+        varlen_K_max,
+        H,
+        is_varlen_K,
     )
 
 

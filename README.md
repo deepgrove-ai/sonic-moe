@@ -40,16 +40,17 @@ pip install -e .
 ```python
 import torch
 from sonicmoe import MoE, KernelBackendMoE
+from sonicmoe.enums import ActivationType
 
 # Create MoE layer
 moe = MoE(
-    num_experts=128,           # Number of experts
-    num_experts_per_tok=8,     # Top-k experts per token
-    hidden_size=4096,          # Hidden dimension
-    intermediate_size=1536,    # Expert intermediate size
-    is_glu=True,               # Whether to use GLU (e.g. SwiGLU) activation
-    add_bias=False,            # Add bias to linear layers
-    std=0.02,                  # Weight initialization std
+    num_experts=128,                           # Number of experts
+    num_experts_per_tok=8,                     # Top-k experts per token
+    hidden_size=4096,                          # Hidden dimension
+    intermediate_size=1536,                    # Expert intermediate size
+    activation_function=ActivationType.SWIGLU, # SwiGLU activation
+    add_bias=False,                            # Add bias to linear layers
+    std=0.02,                                  # Weight initialization std
 ).to(device="cuda", dtype=torch.bfloat16)
 
 # Forward pass
@@ -66,12 +67,12 @@ make test
 ```
 
 ### Example usage
-- SonicMoE with TC top-K choice routing
+- SonicMoE with TC top-K choice routing (SwiGLU activation)
 ```python
-python benchmarks/moe-cute.py --thiek 32768,4096,1024,128,8
+python benchmarks/moe-cute.py --thiek 32768,4096,1024,128,8 --activation swiglu
 ```
 
-- SonicMoE with token rounding routing
+- SonicMoE with token rounding routing (SwiGLU activation)
 ```python
 python benchmarks/moe-token-rounding.py --routing nr --thiekq 16384,4096,1024,256,8,128
 ```

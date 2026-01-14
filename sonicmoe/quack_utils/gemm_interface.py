@@ -6,12 +6,11 @@ from functools import partial
 from typing import Literal, Optional, Tuple
 
 import torch
-from torch import Tensor
-
 from quack.autotuner import AutotuneConfig, autotune
 from quack.cute_dsl_utils import get_device_capacity
 from quack.gemm_config import GemmConfig, get_all_configs
 from quack.gemm_interface import default_config, prune_invalid_gemm_configs
+from torch import Tensor
 
 from .gemm_dgated import gemm_dgated as gemm_dgated_sm90_sm100
 from .gemm_gated import gemm_gated as gemm_gated_sm90_sm100

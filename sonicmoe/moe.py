@@ -9,7 +9,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from .count_cumsum import count_cumsum
-from .enums import KernelBackendMoE
+from .enums import ActivationType, KernelBackendMoE, is_glu
 from .functional import moe_TC_softmax_topk_layer
 
 
@@ -25,6 +25,34 @@ def _swiglu(x: torch.Tensor) -> torch.Tensor:
     u = x[..., 1::2]
     g = x[..., ::2]
     return u * F.silu(g)
+
+
+def _geglu(x: torch.Tensor) -> torch.Tensor:
+    u = x[..., 1::2]
+    g = x[..., ::2]
+    return (F.gelu(g.to(dtype=torch.float32)) * u).to(dtype=g.dtype)
+
+
+def _gelu(x: torch.Tensor) -> torch.Tensor:
+    return F.gelu(x.to(dtype=torch.float32)).to(dtype=x.dtype)
+
+
+def _reglu(x: torch.Tensor) -> torch.Tensor:
+    u = x[..., 1::2]
+    g = x[..., ::2]
+    return (F.relu(g) * u).to(dtype=g.dtype)
+
+
+def _relu(x: torch.Tensor) -> torch.Tensor:
+    return F.relu(x)
+
+
+def _relu_sq(x: torch.Tensor) -> torch.Tensor:
+    return F.relu(x) ** 2
+
+
+def _silu(x: torch.Tensor) -> torch.Tensor:
+    return F.silu(x)
 
 
 class Experts(nn.Module):
@@ -143,7 +171,7 @@ class MoE(nn.Module):
         num_experts_per_tok: int,
         hidden_size: int,
         intermediate_size: int,
-        is_glu: bool,
+        activation_function: ActivationType,
         add_bias: bool,
         std: float,
     ) -> None:
@@ -157,10 +185,12 @@ class MoE(nn.Module):
 
         self.router = nn.Linear(in_features=self.hidden_size, out_features=num_experts, bias=False)
 
+        self.activation_function = activation_function
+
         self.c_fc = Experts(
             num_experts=num_experts,
             in_features=self.hidden_size,
-            out_features=2 * self.intermediate_size if is_glu else self.intermediate_size,
+            out_features=2 * self.intermediate_size if is_glu(activation_function) else self.intermediate_size,
             add_bias=add_bias,
             std=std,
         )
@@ -196,6 +226,7 @@ class MoE(nn.Module):
                 self.c_proj.bias,
                 self.top_k,
                 self.stream_id,
+                self.activation_function,
                 is_inference_mode or not self.training,
             )
         else:
@@ -275,14 +306,21 @@ class MoE(nn.Module):
             expert_frequency, expert_offsets = count_cumsum(selected_experts, self.num_experts, do_cumsum=True)
         else:
             expert_frequency = selected_experts.bincount(minlength=self.num_experts).to(torch.int32)
+            expert_offsets = expert_frequency.cumsum(-1).to(torch.int32)
+
+        act_func = {
+            ActivationType.SWIGLU: _swiglu,
+            ActivationType.GEGLU: _geglu,
+            ActivationType.REGLU: _reglu,
+            ActivationType.GELU: _gelu,
+            ActivationType.RELU: _relu,
+            ActivationType.SILU: _silu,
+            ActivationType.RELU_SQ: _relu_sq,
+        }[self.activation_function]
 
         T = hidden_states.size(0)
 
         if kernel_backend_moe == KernelBackendMoE.scattermoe:
-            if not is_num_experts_multiple_of_4:
-                with torch.no_grad():
-                    expert_offsets = expert_frequency.cumsum(-1)
-
             hidden_states = self.c_fc.up_projection_scattermoe_forward(
                 input=hidden_states,
                 num_experts_per_token=self.top_k,
@@ -290,7 +328,7 @@ class MoE(nn.Module):
                 sorted_scattered_idxs=sorted_scattered_idxs,
                 expert_offsets=expert_offsets,
             )
-            hidden_states = _swiglu(hidden_states)
+            hidden_states = act_func(hidden_states)
             hidden_states = self.c_proj.down_projection_scattermoe_forward(
                 input=hidden_states,
                 num_experts_per_token=1,
@@ -313,7 +351,7 @@ class MoE(nn.Module):
                 input=hidden_states, expert_frequency=expert_frequency, return_list=True
             )
 
-            hidden_states = [_swiglu(i) for i in hidden_states]
+            hidden_states = [act_func(i) for i in hidden_states]
             hidden_states = self.c_proj.torch_forward(input=hidden_states, expert_frequency=None, return_list=False)
 
             hidden_states = hidden_states * batch_gates.unsqueeze(-1)

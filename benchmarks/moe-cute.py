@@ -11,10 +11,45 @@ import cutlass
 import torch
 import torch.nn.functional as F
 from rich import print as print0
+from triton.testing import do_bench
 
 from sonicmoe import MoE
+from sonicmoe.enums import ActivationType, is_glu
 from sonicmoe.functional import moe_TC_softmax_topk_layer
-from triton.testing import do_bench
+
+
+def swiglu(x: torch.Tensor) -> torch.Tensor:
+    u = x[..., 1::2]
+    g = x[..., ::2]
+    return u * F.silu(g)
+
+
+def geglu(x: torch.Tensor) -> torch.Tensor:
+    u = x[..., 1::2]
+    g = x[..., ::2]
+    return F.gelu(g.float()).to(dtype=g.dtype) * u
+
+
+def gelu(x: torch.Tensor) -> torch.Tensor:
+    return F.gelu(x.float()).to(dtype=x.dtype)
+
+
+def reglu(x: torch.Tensor) -> torch.Tensor:
+    u = x[..., 1::2]
+    g = x[..., ::2]
+    return (F.relu(g.float()) * u).to(dtype=g.dtype)
+
+
+def relu(x: torch.Tensor) -> torch.Tensor:
+    return F.relu(x)
+
+
+def relu_sq(x: torch.Tensor) -> torch.Tensor:
+    return F.relu(x) ** 2
+
+
+def silu(x: torch.Tensor) -> torch.Tensor:
+    return F.silu(x)
 
 
 def parse_comma_separated_ints(s: str):
@@ -44,6 +79,9 @@ def parse_arguments() -> argparse.Namespace:
         default=False,
     )
     parser.add_argument(
+        "--activation", choices=["swiglu", "geglu", "reglu", "relu_sq", "relu", "silu", "gelu"], default="swiglu"
+    )
+    parser.add_argument(
         "--add_bias",
         action="store_true",
         default=False,
@@ -68,10 +106,12 @@ def run(
     dtype: Type[cutlass.Numeric],
     skip_test: Type[bool],
     add_bias: Type[bool],
+    activation: Type[str],
     **kwargs,
 ):
     torch_dtype = {cutlass.BFloat16: torch.bfloat16, cutlass.Float16: torch.float16}[dtype]
 
+    activation = ActivationType(activation)
     # Unpack parameters
     T, H, I, E, K = thiek
     TK = T * K
@@ -89,7 +129,7 @@ def run(
             num_experts_per_tok=K,
             hidden_size=H,
             intermediate_size=I,
-            is_glu=True,
+            activation_function=activation,
             add_bias=add_bias,
             std=0.02,
         )
@@ -108,14 +148,7 @@ def run(
     # # Ref check
     if not skip_test:
         o, router_logits, expert_frequency = moe_TC_softmax_topk_layer(
-            x,
-            router_w,
-            w1.permute(1, 2, 0),
-            b1,
-            w2.permute(1, 2, 0),
-            b2,
-            moe.top_k,
-            moe.stream_id,
+            x, router_w, w1.permute(1, 2, 0), b1, w2.permute(1, 2, 0), b2, moe.top_k, moe.stream_id, activation
         )
         if add_bias:
             dx, dw1, db1, dw2, db2, drouter_w = torch.autograd.grad(
@@ -134,6 +167,16 @@ def run(
         ref_expert_frequency = ref_topk_expert_idx.view(-1).bincount(minlength=E).int()
         torch.testing.assert_close(expert_frequency.int(), ref_expert_frequency.int())
 
+        act_func = {
+            ActivationType.SWIGLU: swiglu,
+            ActivationType.GEGLU: geglu,
+            ActivationType.REGLU: reglu,
+            ActivationType.GELU: gelu,
+            ActivationType.RELU: relu,
+            ActivationType.SILU: silu,
+            ActivationType.RELU_SQ: relu_sq,
+        }[activation]
+
         with torch.autocast("cuda:0", torch.float32):
             ref_o = torch.zeros_like(x)
 
@@ -143,7 +186,7 @@ def run(
 
                 if T_idx.numel() > 0:
                     w1_out = F.linear(x[T_idx, :], w1[i, :, :].squeeze(), bias=(b1[i] if add_bias else None))
-                    w1_out = F.silu(w1_out[:, ::2]) * w1_out[:, 1::2]
+                    w1_out = act_func(w1_out)
 
                     w2_out = F.linear(w1_out, w2[i, :, :].squeeze(), bias=(b2[i] if add_bias else None))
 
@@ -184,7 +227,10 @@ def run(
                 print(f"max abs diff on {n} {(our - ref).abs().max():.6f}")
                 print(f"mean rel diff on {n} {((our - ref).abs() / (ref.abs() + 1e-6)).mean():.6f}" + "\n")
 
-    flops = 6 * T * I * H * K
+    if is_glu(activation):
+        flops = 6 * T * I * H * K
+    else:
+        flops = 4 * T * I * H * K
 
     repeats = 500
     warmup = 5
@@ -202,6 +248,7 @@ def run(
             b2,
             moe.top_k,
             moe.stream_id,
+            activation,
             is_inference_mode_enabled,
         )
         return o
@@ -218,14 +265,26 @@ def run(
         f"[bold green][/bold green] Cute-DSL Fwd, inference mode, Average time: {timing:.3f} ms, TFLOPS: {tflops:.1f}"
     )
 
-    flops = 18 * T * I * H * K
+    if is_glu(activation):
+        flops = 18 * T * I * H * K
+    else:
+        flops = 12 * T * I * H * K
 
     time.sleep(0.5)
 
     @torch.compile
     def forward_and_backward():
         o, router_logits, expert_frequency = moe_TC_softmax_topk_layer(
-            x, router_w, w1.permute(1, 2, 0), b1, w2.permute(1, 2, 0), b2, moe.top_k, moe.stream_id, False
+            x,
+            router_w,
+            w1.permute(1, 2, 0),
+            b1,
+            w2.permute(1, 2, 0),
+            b2,
+            moe.top_k,
+            moe.stream_id,
+            activation,
+            False,
         )
         o.backward(dout, retain_graph=True)
         x.grad = w1.grad = w2.grad = router_w.grad = None
@@ -234,7 +293,11 @@ def run(
     tflops = flops / (e2e_timing * 1e9)  # Convert to TFlops
     print0(f"[bold green][/bold green] Cute-DSL Fwd + Bwd Average time: {e2e_timing:.3f} ms, TFLOPS: {tflops:.1f}")
 
-    flops = 12 * T * I * H * K
+    if is_glu(activation):
+        flops = 12 * T * I * H * K
+    else:
+        flops = 8 * T * I * H * K
+
     bwd_time = e2e_timing - fwd_timing
     tflops = flops / (bwd_time / 1e3) / 1e12
     print0(f"[bold green][/bold green] Cute-DSL Bwd Average time: {bwd_time:.3f} ms, TFLOPS: {tflops:.1f}")
@@ -242,5 +305,5 @@ def run(
 
 if __name__ == "__main__":
     args = parse_arguments()
-    run(args.thiek, args.dtype, args.skip_test, args.add_bias)
+    run(args.thiek, args.dtype, args.skip_test, args.add_bias, args.activation)
     print("PASS")

@@ -49,7 +49,6 @@ from cutlass._mlir.dialects import llvm, vector
 from cutlass.cute.nvgpu import cpasync, warp, warpgroup
 from cutlass.cute.runtime import from_dlpack
 from cutlass.cutlass_dsl import T, dsl_user_op
-
 from quack.cute_dsl_utils import ParamsBase
 
 # return PipelineStateWAdvance instead of PipelineState
@@ -84,6 +83,8 @@ class HopperWgmma_MoE_kernel:
         is_persistent: bool = True,
         compute_dz_and_partial_ds_and_y1s: bool = False,
         compute_weight_gradient: bool = False,
+        compute_relu: bool = False,
+        compute_silu: bool = False,
         compute_gelu: bool = False,
         compute_relu_sq: bool = False,
         compute_swiglu: bool = False,
@@ -111,11 +112,13 @@ class HopperWgmma_MoE_kernel:
         self.compute_geglu = compute_geglu
         self.compute_reglu = compute_reglu
 
+        self.compute_relu = compute_relu
+        self.compute_silu = compute_silu
         self.compute_gelu = compute_gelu
         self.compute_relu_sq = compute_relu_sq
 
         self.is_glu = is_glu or (compute_swiglu or compute_geglu or compute_reglu)
-        self.is_normal_act = is_normal_act or (compute_gelu or compute_relu_sq)
+        self.is_normal_act = is_normal_act or (compute_gelu or compute_relu_sq or compute_relu or compute_silu)
 
         self.compute_dz_and_partial_ds_and_y1s = compute_dz_and_partial_ds_and_y1s
         self.compute_weight_gradient = compute_weight_gradient
@@ -1172,7 +1175,6 @@ class HopperWgmma_MoE_kernel:
         if g < Float32(0.0):
             relu_prime_g = 0.0  # derivative of ReLU
 
-        # Gradients
         dg = dy1 * u * relu_prime_g
         du = dy1 * relu_g
 
@@ -1208,6 +1210,30 @@ class HopperWgmma_MoE_kernel:
 
         geglu_output = u * gelu_g
         return dg, du, geglu_output
+
+    @cute.jit
+    def silu_derivative(self, x: Float32, dy1: Float32) -> Tuple[Float32, Float32]:
+        half_x = 0.5 * x
+        tanh_half_x = self.tanh(half_x)
+
+        sig_x = self.fma(0.5, tanh_half_x, 0.5)
+        sig_n_x = 1 - sig_x
+
+        silu_x = self.fma(half_x, tanh_half_x, half_x)
+        dx = dy1 * self.fma(silu_x, sig_n_x, sig_x)
+
+        return dx, silu_x
+
+    @cute.jit
+    def relu_derivative(self, x: Float32, dy1: Float32) -> Tuple[Float32, Float32]:
+        relu_x = cute.arch.fmax(0.0, x)
+
+        relu_prime_x = 1.0
+        if x < Float32(0.0):
+            relu_prime_x = 0.0  # derivative of ReLU
+
+        dx = dy1 * relu_prime_x
+        return dx, relu_x
 
     @cute.jit
     def relu_sq_derivative(self, x: Float32, dy1: Float32) -> Tuple[Float32, Float32]:
@@ -1267,6 +1293,10 @@ class HopperWgmma_MoE_kernel:
             assert cute.size(tRS_rD) == cute.size(tRS_rY)
             if const_expr(self.compute_relu_sq):
                 act_func = self.relu_sq
+            elif const_expr(self.compute_relu):
+                act_func = self.relu
+            elif const_expr(self.compute_silu):
+                act_func = self.silu
             elif const_expr(self.compute_gelu):
                 act_func = self.gelu
             else:
@@ -1305,8 +1335,12 @@ class HopperWgmma_MoE_kernel:
         elif const_expr(self.is_normal_act):
             if const_expr(self.compute_relu_sq):
                 bwd_act_func = self.relu_sq_derivative
+            elif const_expr(self.compute_relu):
+                bwd_act_func = self.relu_derivative
             elif const_expr(self.compute_gelu):
                 bwd_act_func = self.gelu_derivative
+            elif const_expr(self.compute_silu):
+                bwd_act_func = self.silu_derivative
             else:
                 raise NotImplementedError()
 
@@ -1317,7 +1351,7 @@ class HopperWgmma_MoE_kernel:
                 tRS_rAcc[const_expr(epi_idx * cute.size(tRS_rD) + i)] = dy * fwd_output
                 s = sS[tRS_rcD[i]]
                 tRS_rD_out[i] = self.a_dtype(dz * s)
-                tRS_rY[i] = (fwd_output * s).to(self.y_dtype)
+                tRS_rY[i] = self.y_dtype(fwd_output * s)
 
         else:
             raise NotImplementedError()

@@ -10,9 +10,9 @@ import cutlass
 import cutlass.cute as cute
 import torch
 from cutlass import const_expr
-
 from quack.tile_scheduler import RasterOrderOption
 
+from ..enums import ActivationType, is_glu
 from .grouped_gemm import HopperWgmma_MoE_kernel
 
 
@@ -37,14 +37,20 @@ class HopperGEMMConfig:
 
 
 class HopperWgmma_MoE_Up_proj_Fwd:
-    def __init__(self, E: int, H: int, I: int, inference_mode=False):
+    def __init__(self, E: int, H: int, I: int, activation_type: ActivationType, inference_mode=False):
         super().__init__()
-        assert (
-            H % 64 == 0 and H >= 512 and I % 64 == 0
-        ), f"{LIBRARY_NAME} only supports MoE with H % 64 == 0 (H >= 512) and I % 64 == 0"
+        is_glu_activation = is_glu(activation_type)
+        if is_glu_activation:
+            assert (
+                H % 64 == 0 and H >= 512 and I % 64 == 0
+            ), f"{LIBRARY_NAME} only supports GLU MoE with H % 64 == 0 (H >= 512) and I % 64 == 0"
+        else:
+            assert (
+                H % 64 == 0 and H >= 512 and I % 128 == 0
+            ), f"{LIBRARY_NAME} only supports non-GLU MoE with H % 64 == 0 (H >= 512) and I % 128 == 0"
         # TODO: this assertion does not mean that the MoE impl prohibits such config.
         # Instead, we just do not search for the best configs manually yet for small-shaped MoE
-        if I >= 256:
+        if (I >= 128 and is_glu_activation) or (I >= 256 and not is_glu_activation):
             up_config = HopperGEMMConfig(
                 tile_shape_mnk=(128, 256, 64),
                 cluster_shape_mnk=(2, 1),
@@ -53,16 +59,7 @@ class HopperWgmma_MoE_Up_proj_Fwd:
                 initial_d_epi_stage=2,
                 raster_order=RasterOrderOption.AlongM,
             )
-        elif I >= 128:
-            up_config = HopperGEMMConfig(
-                tile_shape_mnk=(128, 256, 64),
-                cluster_shape_mnk=(2, 1),
-                epi_tile_size=(32 if not inference_mode else 64),
-                is_pingpong=False,
-                initial_d_epi_stage=2,
-                raster_order=RasterOrderOption.AlongM,
-            )
-        elif I == 64:
+        elif (I == 64 and is_glu_activation) or (I == 128 and not is_glu_activation):
             up_config = HopperGEMMConfig(
                 tile_shape_mnk=(192, 128, 64),
                 cluster_shape_mnk=(1, 1),
@@ -74,6 +71,34 @@ class HopperWgmma_MoE_Up_proj_Fwd:
         else:
             raise NotImplementedError()
 
+        compute_swiglu = False
+        compute_geglu = False
+        compute_reglu = False
+
+        compute_relu_sq = False
+        compute_silu = False
+        compute_relu = False
+        compute_gelu = False
+
+        if activation_type == ActivationType.SWIGLU:
+            compute_swiglu = True
+        elif activation_type == ActivationType.GEGLU:
+            compute_geglu = True
+        elif activation_type == ActivationType.REGLU:
+            compute_reglu = True
+
+        elif activation_type == ActivationType.RELU_SQ:
+            compute_relu_sq = True
+        elif activation_type == ActivationType.RELU:
+            compute_relu = True
+        elif activation_type == ActivationType.SILU:
+            compute_silu = True
+        elif activation_type == ActivationType.GELU:
+            compute_gelu = True
+
+        else:
+            raise NotImplementedError(f"Activation function {activation_type} not supported yet!")
+
         self.module = HopperWgmma_MoE_kernel(
             E,
             cutlass.Float32,
@@ -81,7 +106,13 @@ class HopperWgmma_MoE_Up_proj_Fwd:
             (*up_config.cluster_shape_mnk, 1),
             pingpong=up_config.is_pingpong,
             is_persistent=True,
-            compute_swiglu=True,
+            compute_swiglu=compute_swiglu,
+            compute_reglu=compute_reglu,
+            compute_geglu=compute_geglu,
+            compute_relu_sq=compute_relu_sq,
+            compute_relu=compute_relu,
+            compute_silu=compute_silu,
+            compute_gelu=compute_gelu,
             is_A_gather=True,
             epi_tile_size=up_config.epi_tile_size,
             initial_d_epi_stage=up_config.initial_d_epi_stage,
@@ -203,11 +234,17 @@ class HopperWgmma_MoE_Down_proj_Fwd:
 
 
 class HopperWgmma_MoE_Down_proj_ActGrad_Bwd:
-    def __init__(self, E: int, H: int, I: int):
+    def __init__(self, E: int, H: int, I: int, activation_type: ActivationType):
         super().__init__()
-        assert (
-            H % 64 == 0 and H >= 512 and I % 64 == 0
-        ), f"{LIBRARY_NAME} only supports MoE with H % 64 == 0 (H >= 512) and I % 64 == 0"
+        is_glu_activation = is_glu(activation_type)
+        if is_glu_activation:
+            assert (
+                H % 64 == 0 and H >= 512 and I % 64 == 0
+            ), f"{LIBRARY_NAME} only supports GLU MoE with H % 64 == 0 (H >= 512) and I % 64 == 0"
+        else:
+            assert (
+                H % 64 == 0 and H >= 512 and I % 128 == 0
+            ), f"{LIBRARY_NAME} only supports non-GLU MoE with H % 64 == 0 (H >= 512) and I % 128 == 0"
 
         # heavy register pressure due to pingpong + heavy epilogue
         #   effectively no alternatives to this config
@@ -220,6 +257,34 @@ class HopperWgmma_MoE_Down_proj_ActGrad_Bwd:
             raster_order=RasterOrderOption.Heuristic,
         )
 
+        compute_swiglu = False
+        compute_geglu = False
+        compute_reglu = False
+
+        compute_relu_sq = False
+        compute_silu = False
+        compute_relu = False
+        compute_gelu = False
+
+        if activation_type == ActivationType.SWIGLU:
+            compute_swiglu = True
+        elif activation_type == ActivationType.GEGLU:
+            compute_geglu = True
+        elif activation_type == ActivationType.REGLU:
+            compute_reglu = True
+
+        elif activation_type == ActivationType.RELU_SQ:
+            compute_relu_sq = True
+        elif activation_type == ActivationType.RELU:
+            compute_relu = True
+        elif activation_type == ActivationType.SILU:
+            compute_silu = True
+        elif activation_type == ActivationType.GELU:
+            compute_gelu = True
+
+        else:
+            raise NotImplementedError(f"Activation function {activation_type} not supported yet!")
+
         self.module = HopperWgmma_MoE_kernel(
             E,
             cutlass.Float32,
@@ -227,7 +292,13 @@ class HopperWgmma_MoE_Down_proj_ActGrad_Bwd:
             (*dz_partial_ds_config.cluster_shape_mnk, 1),
             pingpong=dz_partial_ds_config.is_pingpong,
             is_persistent=True,
-            compute_swiglu=True,
+            compute_swiglu=compute_swiglu,
+            compute_reglu=compute_reglu,
+            compute_geglu=compute_geglu,
+            compute_relu_sq=compute_relu_sq,
+            compute_relu=compute_relu,
+            compute_silu=compute_silu,
+            compute_gelu=compute_gelu,
             compute_dz_and_partial_ds_and_y1s=True,
             is_A_gather=True,
             epi_tile_size=dz_partial_ds_config.epi_tile_size,
@@ -242,8 +313,8 @@ class HopperWgmma_MoE_Down_proj_ActGrad_Bwd:
         self,
         mDout,
         mW2_trans,
-        mZ_FP32,
-        mDz_FP32,
+        mZ_FP32_if_GLU_else_BF16,
+        mDz_FP32_if_GLU_else_BF16,
         mY1S,
         mS,
         mDS_partial,
@@ -257,9 +328,9 @@ class HopperWgmma_MoE_Down_proj_ActGrad_Bwd:
         return self.module(
             mDout,
             mW2_trans,
-            mZ_FP32,
+            mZ_FP32_if_GLU_else_BF16,
             None,
-            mDz_FP32,
+            mDz_FP32_if_GLU_else_BF16,
             mY1S,
             mS,
             mDS_partial,
@@ -353,13 +424,18 @@ class HopperWgmma_MoE_Down_proj_WeightGrad_Bwd:
 
 
 class HopperWgmma_MoE_Up_proj_ActGrad_Bwd:
-    def __init__(self, E: int, H: int, I: int):
+    def __init__(self, E: int, H: int, I: int, is_glu_activation: bool):
         super().__init__()
-        assert (
-            H % 64 == 0 and H >= 512 and I % 64 == 0
-        ), f"{LIBRARY_NAME} only supports MoE with H % 64 == 0 (H >= 512) and I % 64 == 0"
+        if is_glu_activation:
+            assert (
+                H % 64 == 0 and H >= 512 and I % 64 == 0
+            ), f"{LIBRARY_NAME} only supports GLU MoE with H % 64 == 0 (H >= 512) and I % 64 == 0"
+        else:
+            assert (
+                H % 64 == 0 and H >= 512 and I % 128 == 0
+            ), f"{LIBRARY_NAME} only supports non-GLU MoE with H % 64 == 0 (H >= 512) and I % 128 == 0"
 
-        if I >= 512:
+        if (I >= 512 and is_glu_activation) or (I >= 1024 and not is_glu_activation):
             dx_config = HopperGEMMConfig(
                 tile_shape_mnk=(128, 256, 64),
                 cluster_shape_mnk=(2, 1),
@@ -368,7 +444,7 @@ class HopperWgmma_MoE_Up_proj_ActGrad_Bwd:
                 initial_d_epi_stage=4,
                 raster_order=RasterOrderOption.AlongN,
             )
-        elif I >= 64:
+        elif (I >= 64 and is_glu_activation) or (I >= 128 and not is_glu_activation):
             dx_config = HopperGEMMConfig(
                 tile_shape_mnk=(128, 192, 64),
                 cluster_shape_mnk=(2, 1),
@@ -428,13 +504,18 @@ class HopperWgmma_MoE_Up_proj_ActGrad_Bwd:
 
 
 class HopperWgmma_MoE_Up_proj_WeightGrad_Bwd:
-    def __init__(self, E: int, H: int, I: int):
+    def __init__(self, E: int, H: int, I: int, is_glu_activation: bool):
         super().__init__()
-        assert (
-            H % 64 == 0 and H >= 512 and I % 64 == 0
-        ), f"{LIBRARY_NAME} only supports MoE with H % 64 == 0 (H >= 512) and I % 64 == 0"
+        if is_glu_activation:
+            assert (
+                H % 64 == 0 and H >= 512 and I % 64 == 0
+            ), f"{LIBRARY_NAME} only supports GLU MoE with H % 64 == 0 (H >= 512) and I % 64 == 0"
+        else:
+            assert (
+                H % 64 == 0 and H >= 512 and I % 128 == 0
+            ), f"{LIBRARY_NAME} only supports non-GLU MoE with H % 64 == 0 (H >= 512) and I % 128 == 0"
 
-        if I >= 128:
+        if (I >= 128 and is_glu_activation) or (I >= 256 and not is_glu_activation):
             dw1_config = HopperGEMMConfig(
                 tile_shape_mnk=(128, 256, 64),
                 cluster_shape_mnk=(2, 1),
@@ -443,7 +524,7 @@ class HopperWgmma_MoE_Up_proj_WeightGrad_Bwd:
                 initial_d_epi_stage=6,
                 raster_order=RasterOrderOption.Heuristic,
             )
-        elif I == 64:
+        elif (I == 64 and is_glu_activation) or (I == 128 and not is_glu_activation):
             dw1_config = HopperGEMMConfig(
                 tile_shape_mnk=(256, 128, 64),
                 cluster_shape_mnk=(2, 1),

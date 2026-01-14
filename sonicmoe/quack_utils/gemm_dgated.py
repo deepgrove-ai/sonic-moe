@@ -11,14 +11,12 @@ import cutlass
 import cutlass.cute as cute
 import cutlass.torch as cutlass_torch
 import cutlass.utils.blackwell_helpers as sm100_utils
-import torch
-from cutlass import Float32, Int32, const_expr
-from cutlass.cute.runtime import from_dlpack
-from torch import Tensor
-
 import quack.activation
 import quack.sm90_utils as sm90_utils
 import quack.utils as utils
+import torch
+from cutlass import Float32, Int32, const_expr
+from cutlass.cute.runtime import from_dlpack
 from quack.cute_dsl_utils import (
     ArgumentsBase,
     ParamsBase,
@@ -34,6 +32,7 @@ from quack.gemm_wrapper_utils import GemmWrapperBase
 from quack.reduce import warp_reduce
 from quack.sm90_utils import partition_for_epilogue
 from quack.varlen_utils import VarlenManager
+from torch import Tensor
 
 
 class GemmDGatedMixin(GemmActMixin):
