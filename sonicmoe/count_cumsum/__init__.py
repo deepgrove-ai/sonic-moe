@@ -15,7 +15,7 @@ def count_cumsum_cuda(x: torch.Tensor, count_output: torch.Tensor, cumsum_output
 
 
 @torch.no_grad()
-def count_cumsum(x: torch.Tensor, E: int, do_cumsum: bool = True, use_triton: bool = False):
+def count_cumsum(x: torch.Tensor, E: int, do_cumsum: bool = True, use_triton: bool = True):
     assert x.dim() == 1, "x should be 1-dimensional"
     assert x.dtype in [torch.int32, torch.long]
     if use_triton:
