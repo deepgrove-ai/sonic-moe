@@ -1,0 +1,33 @@
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "sonicmoe"
+version = "0.0.1"
+description = "Accelerating MoE with IO and Tile-aware Optimizations"
+readme = "README.md"
+requires-python = ">=3.12"
+license = {file = "LICENSE"}
+authors = [
+    { name = "Wentao Guo" },
+    { name = "Mayank Mishra" },
+    { name = "Xinle Cheng" },
+    { name = "Ion Stoica" },
+    { name = "Tri Dao" }
+]
+dependencies = [
+    "torch>=2.7.1",
+    "nvidia-cutlass-dsl==4.2.1",
+    "quack-kernels @ git+https://github.com/Dao-AILab/quack.git@3d0ab3ec2164749caac8f269f771e66a40efd2de",
+    "pytest",
+    "parameterized",
+    "ninja",
+    "rich",
+]
+
+[tool.setuptools.packages.find]
+where = ["."]
+
+[tool.setuptools.package-data]
+"*" = ["**/*.cu", "**/*.cpp", "**/*.cuh", "**/*.h", "**/*.pyx", "**/*.yml"]
