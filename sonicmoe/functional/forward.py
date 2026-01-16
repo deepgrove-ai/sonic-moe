@@ -15,6 +15,7 @@ from ..utils import convert_torch_tensor_to_cute_tensor
 from .moe_config import HopperWgmma_MoE_Down_proj_Fwd, HopperWgmma_MoE_Up_proj_Fwd
 from .reduction_over_k_gather import token_gather_and_sum_varlen_K_triton
 from .topk_softmax import TopK_Softmax
+from .expertbias_topk import TopK_bias
 
 
 @torch.library.custom_op(f"{LIBRARY_NAME}::_topk_fwd", mutates_args={"values", "indices"})
@@ -48,6 +49,60 @@ def _topk_fwd(
 
 
 _topk_fwd.compile_cache = {}
+
+@torch.library.custom_op(f"{LIBRARY_NAME}::_topk_bias_fwd", mutates_args={"values", "indices"})
+def _topk_bias_fwd(
+    x_biased: torch.Tensor,
+    bias: torch.Tensor,
+    k: int,
+    values: torch.Tensor,
+    indices: torch.Tensor,
+    require_softmax_fusion: bool = True
+) -> None:
+    """Top-k forward pass with bias subtraction.
+    
+    Args:
+        x_biased: Input tensor of shape (M, N) - biased logits
+        bias: Bias tensor of shape (N,) - expert bias values
+        k: Number of top elements to return
+        values: Output tensor of shape (M, k) for top-k values (unbiased and softmaxed)
+        indices: Output tensor of shape (M, k) for top-k indices
+        require_softmax_fusion: Whether to apply softmax normalization
+    
+    Returns:
+        None (mutates values and indices in-place)
+    """
+    N = x_biased.size(1)
+    input_dtype = torch2cute_dtype_map[x_biased.dtype]
+    output_dtype = torch2cute_dtype_map[values.dtype]
+    
+    convert_from_dlpack = lambda tensor: (
+        from_dlpack(tensor.detach(), assumed_align=16).mark_compact_shape_dynamic(mode=0, stride_order=(0, 1))
+    )
+    
+    # Convert tensors to cute format
+    x_biased_tensor, values_tensor, indices_tensor = [
+        convert_from_dlpack(tensor) for tensor in (x_biased, values, indices)
+    ]
+    
+    # Bias is 1D, so we need to handle it differently
+    bias_tensor = from_dlpack(bias.detach(), assumed_align=16).mark_compact_shape_dynamic(mode=0, stride_order=(0,))
+    
+    current_stream = cuda.CUstream(torch.cuda.current_stream().cuda_stream)
+    
+    compile_key = (input_dtype, output_dtype, N, k, require_softmax_fusion)
+    
+    if compile_key not in _topk_bias_fwd.compile_cache:
+        topk_bias_op = TopK_bias(input_dtype, output_dtype, N, k, require_softmax_fusion)
+        _topk_bias_fwd.compile_cache[compile_key] = cute.compile(
+            topk_bias_op, x_biased_tensor, bias_tensor, values_tensor, indices_tensor, current_stream
+        )
+    
+    _topk_bias_fwd.compile_cache[compile_key](
+        x_biased_tensor, bias_tensor, values_tensor, indices_tensor, current_stream
+    )
+
+_topk_bias_fwd.compile_cache = {}
 
 
 @torch.library.custom_op(f"{LIBRARY_NAME}::_up_projection_forward", mutates_args={"z", "y1"})
