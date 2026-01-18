@@ -1,6 +1,7 @@
 # ********************************************************************************
 # Copyright (c) 2025, Wentao Guo, Mayank Mishra, Xinle Cheng, Ion Stoica, Tri Dao
 # ********************************************************************************
+from __future__ import annotations
 
 import os
 
@@ -11,8 +12,8 @@ from quack.gemm_interface import gemm
 from ..count_cumsum import count_cumsum
 from ..enums import ActivationType, is_glu
 from ..quack_utils import gemm_dgated, gemm_gated
-from .backward import _down_projection_backward, _softmax_topk_bwd, _token_broadcast_backward, _up_projection_backward, _topk_bwd
-from .forward import _down_projection_forward, _router_forward, _softmax_topk_fwd, _up_projection_forward, _topk_fwd
+from .backward import _down_projection_backward, _softmax_topk_bwd, _token_broadcast_backward, _topk_bwd, _up_projection_backward
+from .forward import _down_projection_forward, _router_forward, _softmax_topk_fwd, _topk_fwd, _up_projection_forward
 from .utils import enable_quack_gemm, is_using_quack_gemm
 
 
@@ -49,7 +50,6 @@ def TC_topk_router_metadata(
 def general_routing_router_metadata(
     router_scores_selected: torch.Tensor, sorted_selected_T: torch.Tensor, selected_E: torch.Tensor, T: int, E: int
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-
     device = router_scores_selected.device
 
     expert_frequency, expert_frequency_offset = count_cumsum(selected_E, E, do_cumsum=True)
@@ -109,6 +109,7 @@ class TC_Softmax_Topk_Router_Function(torch.autograd.Function):
         _softmax_topk_bwd(dlogits, None, dtopk_score, topk_router_score, topk_router_indices, K)
 
         return dlogits, None, None
+
 
 class TC_Topk_Router_Function(torch.autograd.Function):
     @staticmethod
@@ -448,7 +449,6 @@ class _DownProjection(torch.autograd.Function):
         return None, dz, dw2, db2, ds, *[None] * 10
 
 
-
 def moe_TC_softmax_topk_layer(
     x: torch.Tensor,
     router_w: torch.Tensor,
@@ -460,14 +460,14 @@ def moe_TC_softmax_topk_layer(
     stream_id: int,
     activation_type: ActivationType | str = ActivationType.SWIGLU,
     is_inference_mode_enabled: bool = False,
-    bias: torch.Tensor = None, 
-    scaling_factor: float = 2.5,
+    bias: torch.Tensor = None,
+    scaling_factor: float = 1.0,
     norm_topk: bool = False,
     mod=None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    assert ((b1 is None) and (b2 is None)) or (
-        (b1 is not None) and (b2 is not None)
-    ), "b1 and b2 has to be None or not None at the same time!"
+    assert ((b1 is None) and (b2 is None)) or ((b1 is not None) and (b2 is not None)), (
+        "b1 and b2 has to be None or not None at the same time!"
+    )
     if bias is None:
         router_logits = F.linear(x, router_w)
         topk_scores, topk_indices = TC_Softmax_Topk_Router_Function.apply(router_logits, router_w.size(0), K)
@@ -487,7 +487,7 @@ def moe_TC_softmax_topk_layer(
     if mod is None:
         topk_scores = topk_scores / (topk_scores.sum(dim=-1, keepdim=True) + 1e-6)
         topk_scores = topk_scores * scaling_factor
-        
+
     (
         expert_frequency_offset,
         x_gather_idx,
@@ -543,7 +543,7 @@ def moe_TC_softmax_topk_layer(
 # Weight format requirements:
 # - w1_weight: Shape (2*I, H, E), stride order (2, 0, 1), must be interleaved [gate_row0, up_row0, gate_row1, up_row1, ...]
 # - w2_weight: Shape (H, I, E), stride order (2, 0, 1)
-# 
+#
 # We assume token_indices is already SORTED ascendingly !!!
 #   and len(token_indices) = len(expert_indices) = len(router_scores)
 # !!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
@@ -561,9 +561,9 @@ def moe_general_routing_inputs(
     activation_type: ActivationType,
     is_inference_mode_enabled: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    assert ((b1 is None) and (b2 is None)) or (
-        (b1 is not None) and (b2 is not None)
-    ), "b1 and b2 has to be None or not None at the same time!"
+    assert ((b1 is None) and (b2 is None)) or ((b1 is not None) and (b2 is not None)), (
+        "b1 and b2 has to be None or not None at the same time!"
+    )
 
     T = x.size(0)
     TK = router_scores.size(0)
