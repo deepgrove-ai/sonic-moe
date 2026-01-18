@@ -460,7 +460,7 @@ def moe_TC_softmax_topk_layer(
     stream_id: int,
     activation_type: ActivationType | str = ActivationType.SWIGLU,
     is_inference_mode_enabled: bool = False,
-    bias: torch.Tensor = None,
+    bias: torch.Tensor | None = None,
     scaling_factor: float = 1.0,
     norm_topk: bool = False,
     mod=None,
@@ -483,8 +483,8 @@ def moe_TC_softmax_topk_layer(
         bias_to_subtract = bias[topk_indices]
         topk_scores = topk_scores - bias_to_subtract
         expert_frequency, expert_frequency_offset = count_cumsum(topk_indices.view(-1), router_w.size(0), do_cumsum=True)
-    # if norm_topk:
-    if mod is None:
+
+    if norm_topk:
         topk_scores = topk_scores / (topk_scores.sum(dim=-1, keepdim=True) + 1e-6)
         topk_scores = topk_scores * scaling_factor
 
